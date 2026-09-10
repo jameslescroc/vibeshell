@@ -17,6 +17,42 @@ pub struct ServerKeyInfo {
     pub algorithm: String,
 }
 
+/// A single prompt sent by the server during keyboard-interactive authentication.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyboardInteractivePrompt {
+    /// Label to display, e.g. `"Verification code: "`.
+    pub prompt: String,
+    /// When `false`, the answer must be masked in the UI (passwords, PINs).
+    pub echo: bool,
+}
+
+/// Result of one step of keyboard-interactive authentication (RFC 4256).
+///
+/// Unlike password or public-key authentication, keyboard-interactive is a
+/// conversation: the server may ask for several things in a row (a TOTP code,
+/// then a password) and may repeat itself. Callers must keep answering
+/// [`Self::Prompts`] until they receive [`Self::Authenticated`] or
+/// [`Self::Rejected`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum KeyboardInteractiveOutcome {
+    /// The server accepted the credentials; the session is ready to use.
+    Authenticated,
+    /// The server rejected the credentials. The connection has been discarded.
+    Rejected,
+    /// The server is asking for input. Answer with
+    /// [`SshClient::keyboard_interactive_respond`].
+    Prompts {
+        /// Optional title supplied by the server (often empty).
+        name: String,
+        /// Optional instructions supplied by the server (often empty).
+        instructions: String,
+        /// Prompts to present, in order. One answer per prompt is required.
+        prompts: Vec<KeyboardInteractivePrompt>,
+    },
+}
+
 #[derive(Clone)]
 pub struct SshClient {
     session: Arc<Mutex<Option<client::Handle<ClientHandler>>>>,
@@ -238,6 +274,181 @@ impl SshClient {
             *session_guard = Some(session);
         }
         Ok(())
+    }
+
+    /// Start keyboard-interactive authentication (RFC 4256).
+    ///
+    /// This is the method required by servers configured with
+    /// `AuthenticationMethods keyboard-interactive`, which is how most
+    /// two-factor setups (Google Authenticator / PAM) are deployed: neither
+    /// `password` nor `publickey` is offered, and the server drives a
+    /// multi-prompt conversation instead.
+    ///
+    /// On [`KeyboardInteractiveOutcome::Prompts`] the underlying session is
+    /// kept open, mid-authentication, so answers can be supplied with
+    /// [`Self::keyboard_interactive_respond`].
+    pub async fn connect_keyboard_interactive(
+        &mut self,
+        host: &str,
+        port: u16,
+        username: &str,
+        submethods: Option<&str>,
+    ) -> Result<KeyboardInteractiveOutcome> {
+        info!(
+            "[SSH] Starting keyboard-interactive authentication to {}:{}",
+            host, port
+        );
+        debug!(
+            "[SSH] Username: {}, Submethods: {}",
+            username,
+            submethods.unwrap_or("<none>")
+        );
+
+        // Clear any previously captured server key
+        self.clear_server_key().await;
+
+        // Same timeouts as the other authentication paths: a 2FA prompt is
+        // answered by a human, so the inactivity timeout has to be generous.
+        let config = Arc::new(client::Config {
+            inactivity_timeout: Some(std::time::Duration::from_secs(300)),
+            keepalive_interval: Some(std::time::Duration::from_secs(10)),
+            keepalive_max: 5,
+            ..Default::default()
+        });
+
+        let handler = ClientHandler {
+            output_tx: self.output_tx.clone(),
+            shell_channel_id: self.shell_channel_id.clone(),
+            server_key: self.server_key.clone(),
+        };
+
+        let tcp_timeout = tokio::time::Duration::from_secs(300);
+        info!(
+            "[SSH] Attempting TCP connection to {}:{} (timeout: {}s)...",
+            host,
+            port,
+            tcp_timeout.as_secs()
+        );
+        let mut session =
+            tokio::time::timeout(tcp_timeout, client::connect(config, (host, port), handler))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                "TCP connection to {}:{} timed out after {}s (check network/Tailscale/VPN status)",
+                host,
+                port,
+                tcp_timeout.as_secs()
+            )
+                })?
+                .with_context(|| format!("Failed to connect to {}:{}", host, port))?;
+
+        info!("[SSH] TCP connection established, starting keyboard-interactive authentication...");
+        let response = session
+            .authenticate_keyboard_interactive_start(
+                username,
+                submethods.map(|value| value.to_owned()),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Keyboard-interactive authentication failed for user '{}'",
+                    username
+                )
+            })?;
+
+        // Keep the half-authenticated session so answers can be sent to it.
+        {
+            let mut session_guard = self.session.lock().await;
+            *session_guard = Some(session);
+        }
+
+        self.handle_keyboard_interactive_response(response, username)
+            .await
+    }
+
+    /// Answer the prompts returned by
+    /// [`Self::connect_keyboard_interactive`].
+    ///
+    /// The number of `responses` must match the number of prompts received, in
+    /// the same order. The server may reply with further prompts, in which case
+    /// this must be called again.
+    pub async fn keyboard_interactive_respond(
+        &mut self,
+        username: &str,
+        responses: Vec<String>,
+    ) -> Result<KeyboardInteractiveOutcome> {
+        debug!(
+            "[SSH] Sending {} keyboard-interactive response(s)",
+            responses.len()
+        );
+
+        let response = {
+            let mut session_guard = self.session.lock().await;
+            let session = session_guard.as_mut().ok_or_else(|| {
+                anyhow!("No keyboard-interactive authentication is in progress")
+            })?;
+            session
+                .authenticate_keyboard_interactive_respond(responses)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Keyboard-interactive authentication failed for user '{}'",
+                        username
+                    )
+                })?
+        };
+
+        self.handle_keyboard_interactive_response(response, username)
+            .await
+    }
+
+    /// Translate a russh response into our serializable outcome, dropping the
+    /// session when the server rejects the attempt.
+    async fn handle_keyboard_interactive_response(
+        &mut self,
+        response: client::KeyboardInteractiveAuthResponse,
+        username: &str,
+    ) -> Result<KeyboardInteractiveOutcome> {
+        match response {
+            client::KeyboardInteractiveAuthResponse::Success => {
+                info!(
+                    "[SSH] Keyboard-interactive authentication successful for user '{}'",
+                    username
+                );
+                Ok(KeyboardInteractiveOutcome::Authenticated)
+            }
+            client::KeyboardInteractiveAuthResponse::Failure => {
+                error!(
+                    "[SSH] Keyboard-interactive authentication rejected for user '{}'",
+                    username
+                );
+                // Discard the unusable session so a retry starts from scratch.
+                let mut session_guard = self.session.lock().await;
+                *session_guard = None;
+                Ok(KeyboardInteractiveOutcome::Rejected)
+            }
+            client::KeyboardInteractiveAuthResponse::InfoRequest {
+                name,
+                instructions,
+                prompts,
+            } => {
+                debug!(
+                    "[SSH] Server sent {} keyboard-interactive prompt(s)",
+                    prompts.len()
+                );
+                Ok(KeyboardInteractiveOutcome::Prompts {
+                    name,
+                    instructions,
+                    prompts: prompts
+                        .into_iter()
+                        .map(|prompt| KeyboardInteractivePrompt {
+                            prompt: prompt.prompt,
+                            echo: prompt.echo,
+                        })
+                        .collect(),
+                })
+            }
+        }
     }
 
     pub async fn connect_key(
