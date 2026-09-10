@@ -7,8 +7,10 @@ use tauri::{AppHandle, Emitter, State};
 use crate::ipc::{IpcClient, IpcMessage, IpcSessionInfo};
 use crate::local_shell::LocalShellManager;
 use crate::mcp::SharedAgentInputTracker;
-use crate::session::{Session, SessionInfo, SessionManager, SshCredential};
-use crate::ssh::PtyConfig;
+use crate::session::{
+    KeyboardInteractiveStep, Session, SessionInfo, SessionManager, SshCredential,
+};
+use crate::ssh::{KeyboardInteractivePrompt, PtyConfig};
 use crate::storage::Database;
 
 use super::SftpState;
@@ -30,6 +32,58 @@ pub struct ConnectRequest {
     pub rows: Option<u32>,
     #[serde(default)]
     pub force_new: bool,
+}
+
+/// Start a keyboard-interactive (RFC 4256 / 2FA) exchange for a saved server.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyboardInteractiveStartRequest {
+    pub server_name: String,
+    pub cols: Option<u32>,
+    pub rows: Option<u32>,
+}
+
+/// Answer one round of keyboard-interactive prompts.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyboardInteractiveRespondRequest {
+    pub auth_id: String,
+    /// One answer per prompt, in the order the prompts were received.
+    pub responses: Vec<String>,
+}
+
+/// Abandon an in-flight keyboard-interactive exchange.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyboardInteractiveCancelRequest {
+    pub auth_id: String,
+}
+
+/// One step of a keyboard-interactive conversation, as sent to the UI.
+///
+/// `authId` is echoed on every variant so the caller can keep answering the
+/// same exchange without tracking it separately.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum KeyboardInteractiveStepDto {
+    /// Authentication succeeded; the session is connected and usable.
+    #[serde(rename_all = "camelCase")]
+    Authenticated {
+        auth_id: String,
+        session: SessionInfo,
+    },
+    /// The server refused the answers. The connection has been discarded and a
+    /// retry has to start a new exchange.
+    #[serde(rename_all = "camelCase")]
+    Rejected { auth_id: String },
+    /// The server is asking for input. Answers must be supplied in order.
+    #[serde(rename_all = "camelCase")]
+    Prompts {
+        auth_id: String,
+        name: String,
+        instructions: String,
+        prompts: Vec<KeyboardInteractivePrompt>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,6 +481,121 @@ pub async fn session_connect(
     ensure_session_output_forwarder(app, session).await;
 
     Ok(info)
+}
+
+/// Start keyboard-interactive authentication (RFC 4256) for a saved server.
+///
+/// This is the path for servers configured with
+/// `AuthenticationMethods keyboard-interactive`, i.e. most Google
+/// Authenticator / PAM two-factor setups: they offer neither `password` nor
+/// `publickey`, and drive a prompt conversation instead.
+///
+/// Nothing is persisted: the answers (a TOTP code, a password) are supplied by
+/// the user at connection time and never stored.
+#[tauri::command]
+pub async fn session_keyboard_interactive_start(
+    app: AppHandle,
+    manager: State<'_, Arc<SessionManager>>,
+    access_state: State<'_, Arc<SessionAccessState>>,
+    request: KeyboardInteractiveStartRequest,
+) -> Result<KeyboardInteractiveStepDto, String> {
+    if access_state.is_remote() {
+        return Err(
+            "Keyboard-interactive authentication is not available over a remote connection yet"
+                .to_string(),
+        );
+    }
+
+    let pty_config = Some(PtyConfig {
+        term: "xterm-256color".to_string(),
+        cols: request.cols.unwrap_or(80),
+        rows: request.rows.unwrap_or(24),
+        pix_width: 0,
+        pix_height: 0,
+    });
+
+    let (auth_id, step) = manager
+        .start_keyboard_interactive(&request.server_name, pty_config)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    keyboard_interactive_step_to_dto(app, auth_id, step).await
+}
+
+/// Answer one round of keyboard-interactive prompts.
+///
+/// The server may reply with further prompts (the usual "verification code",
+/// then "password" sequence), in which case this must be called again with the
+/// same `authId`.
+#[tauri::command]
+pub async fn session_keyboard_interactive_respond(
+    app: AppHandle,
+    manager: State<'_, Arc<SessionManager>>,
+    access_state: State<'_, Arc<SessionAccessState>>,
+    request: KeyboardInteractiveRespondRequest,
+) -> Result<KeyboardInteractiveStepDto, String> {
+    if access_state.is_remote() {
+        return Err(
+            "Keyboard-interactive authentication is not available over a remote connection yet"
+                .to_string(),
+        );
+    }
+
+    let auth_id = request.auth_id;
+    let step = manager
+        .respond_keyboard_interactive(&auth_id, request.responses)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    keyboard_interactive_step_to_dto(app, auth_id, step).await
+}
+
+/// Abandon an in-flight keyboard-interactive exchange, closing the
+/// half-authenticated connection. Unknown ids are not an error.
+#[tauri::command]
+pub async fn session_keyboard_interactive_cancel(
+    manager: State<'_, Arc<SessionManager>>,
+    access_state: State<'_, Arc<SessionAccessState>>,
+    request: KeyboardInteractiveCancelRequest,
+) -> Result<(), String> {
+    if access_state.is_remote() {
+        return Ok(());
+    }
+
+    manager
+        .cancel_keyboard_interactive(&request.auth_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Convert a manager-level step into the UI-facing payload, starting the
+/// output forwarder once the session actually exists.
+async fn keyboard_interactive_step_to_dto(
+    app: AppHandle,
+    auth_id: String,
+    step: KeyboardInteractiveStep,
+) -> Result<KeyboardInteractiveStepDto, String> {
+    match step {
+        KeyboardInteractiveStep::Authenticated(session) => {
+            let info = session.get_info().await;
+            ensure_session_output_forwarder(app, session).await;
+            Ok(KeyboardInteractiveStepDto::Authenticated {
+                auth_id,
+                session: info,
+            })
+        }
+        KeyboardInteractiveStep::Rejected => Ok(KeyboardInteractiveStepDto::Rejected { auth_id }),
+        KeyboardInteractiveStep::Prompts {
+            name,
+            instructions,
+            prompts,
+        } => Ok(KeyboardInteractiveStepDto::Prompts {
+            auth_id,
+            name,
+            instructions,
+            prompts,
+        }),
+    }
 }
 
 /// Kill a specific session by ID
@@ -1403,4 +1572,76 @@ echo "===NETDEV==="; cat /proc/net/dev
         network,
         collected_at: chrono::Utc::now().timestamp(),
     })
+}
+
+#[cfg(test)]
+mod keyboard_interactive_tests {
+    use super::*;
+    use crate::session::SessionState;
+
+    /// The frontend reads `kind`, `authId` and `echo` directly. Renaming any of
+    /// them silently breaks the 2FA dialog, so the wire shape is pinned here.
+    #[test]
+    fn prompts_are_serialized_in_the_shape_the_ui_expects() {
+        let dto = KeyboardInteractiveStepDto::Prompts {
+            auth_id: "auth-1".to_string(),
+            name: "Two-factor".to_string(),
+            instructions: "Enter your code".to_string(),
+            prompts: vec![
+                KeyboardInteractivePrompt {
+                    prompt: "Verification code: ".to_string(),
+                    echo: true,
+                },
+                KeyboardInteractivePrompt {
+                    prompt: "Password: ".to_string(),
+                    echo: false,
+                },
+            ],
+        };
+
+        let json = serde_json::to_value(&dto).unwrap();
+
+        assert_eq!(json["kind"], "prompts");
+        assert_eq!(json["authId"], "auth-1");
+        assert_eq!(json["name"], "Two-factor");
+        assert_eq!(json["instructions"], "Enter your code");
+        assert_eq!(json["prompts"][0]["prompt"], "Verification code: ");
+        assert_eq!(json["prompts"][0]["echo"], true);
+        // echo == false is what tells the UI to mask the field.
+        assert_eq!(json["prompts"][1]["echo"], false);
+    }
+
+    #[test]
+    fn a_rejection_still_carries_the_exchange_id() {
+        let dto = KeyboardInteractiveStepDto::Rejected {
+            auth_id: "auth-1".to_string(),
+        };
+
+        let json = serde_json::to_value(&dto).unwrap();
+
+        assert_eq!(json["kind"], "rejected");
+        assert_eq!(json["authId"], "auth-1");
+    }
+
+    #[test]
+    fn success_carries_the_session_the_ui_has_to_attach_to() {
+        let dto = KeyboardInteractiveStepDto::Authenticated {
+            auth_id: "auth-1".to_string(),
+            session: SessionInfo {
+                id: "session-42".to_string(),
+                server_id: "server-1".to_string(),
+                server_name: "backup".to_string(),
+                state: SessionState::Connected,
+                created_at: 1,
+                clients: 1,
+            },
+        };
+
+        let json = serde_json::to_value(&dto).unwrap();
+
+        assert_eq!(json["kind"], "authenticated");
+        assert_eq!(json["authId"], "auth-1");
+        assert_eq!(json["session"]["id"], "session-42");
+        assert_eq!(json["session"]["state"], "connected");
+    }
 }

@@ -1,10 +1,11 @@
-import { useState, useCallback, useEffect } from 'react';
-import { X, Key, Lock, Eye, EyeOff, FolderOpen, FileKey, ArrowRightLeft } from 'lucide-react';
+import { useState, useCallback, useEffect, useRef } from 'react';
+import { X, Key, Lock, Eye, EyeOff, FolderOpen, FileKey, ArrowRightLeft, ShieldCheck } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useServerStore, type Server } from '../../stores/serverStore';
 import { safeInvoke } from '../../lib/tauri';
 import { useRuntimeCapabilitiesStore } from '../../stores/runtimeCapabilitiesStore';
+import { KeyboardInteractiveDialog } from '../KeyboardInteractiveDialog';
 
 interface ConnectDialogProps {
   isOpen: boolean;
@@ -12,6 +13,38 @@ interface ConnectDialogProps {
   forceNew?: boolean;
   onClose: () => void;
   onConnected: (sessionId: string) => void;
+}
+
+/**
+ * Which authentication flow the user last used for a given server.
+ *
+ * Two-factor servers cannot be described by the stored `auth_type`: a
+ * keyboard-interactive exchange has nothing to persist (a TOTP code expires in
+ * about 30 seconds), so the database schema is deliberately left alone. The
+ * preference is a pure UI convenience and lives in localStorage.
+ */
+const AUTH_METHOD_STORAGE_PREFIX = 'vibeshell.auth-method.';
+
+function readPreferredAuthMethod(serverName: string): 'keyboard-interactive' | null {
+  try {
+    const value = window.localStorage.getItem(`${AUTH_METHOD_STORAGE_PREFIX}${serverName}`);
+    return value === 'keyboard-interactive' ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function writePreferredAuthMethod(serverName: string, method: 'keyboard-interactive' | null): void {
+  try {
+    const storageKey = `${AUTH_METHOD_STORAGE_PREFIX}${serverName}`;
+    if (method === null) {
+      window.localStorage.removeItem(storageKey);
+    } else {
+      window.localStorage.setItem(storageKey, method);
+    }
+  } catch {
+    // A blocked or full localStorage must never prevent connecting.
+  }
 }
 
 function JumpHostBadge({ jumpHostId }: { jumpHostId: string }) {
@@ -41,6 +74,10 @@ export function ConnectDialog({ isOpen, server, forceNew = false, onClose, onCon
   const [usingSavedCredentials, setUsingSavedCredentials] = useState(false);
   const [isLoadingCredentials, setIsLoadingCredentials] = useState(false);
 
+  // Two-factor / keyboard-interactive flow (RFC 4256)
+  const [useKeyboardInteractive, setUseKeyboardInteractive] = useState(false);
+  const connectedViaKeyboardInteractive = useRef(false);
+
   // Load saved credentials when dialog opens
   useEffect(() => {
     if (isOpen && server) {
@@ -54,6 +91,9 @@ export function ConnectDialog({ isOpen, server, forceNew = false, onClose, onCon
       setIsLoadingKey(false);
       setUsingSavedCredentials(false);
       setIsLoadingCredentials(true);
+      connectedViaKeyboardInteractive.current = false;
+      // Reopen straight into the 2FA flow when that is what worked last time.
+      setUseKeyboardInteractive(readPreferredAuthMethod(server.name) === 'keyboard-interactive');
 
       // Try to load saved credentials
       const loadCredentials = async () => {
@@ -209,7 +249,41 @@ export function ConnectDialog({ isOpen, server, forceNew = false, onClose, onCon
     return parts[parts.length - 1] || path;
   };
 
+  const handleKeyboardInteractiveConnected = useCallback(
+    (sessionId: string) => {
+      if (server) {
+        writePreferredAuthMethod(server.name, 'keyboard-interactive');
+      }
+      connectedViaKeyboardInteractive.current = true;
+      onConnected(sessionId);
+    },
+    [server, onConnected]
+  );
+
+  // The 2FA dialog closes itself both on success and on cancel. On success the
+  // whole connect flow is done; on cancel the user goes back to the normal
+  // password/key form so they can pick another method.
+  const handleKeyboardInteractiveClose = useCallback(() => {
+    if (connectedViaKeyboardInteractive.current) {
+      connectedViaKeyboardInteractive.current = false;
+      onClose();
+      return;
+    }
+    setUseKeyboardInteractive(false);
+  }, [onClose]);
+
   if (!isOpen || !server) return null;
+
+  if (useKeyboardInteractive) {
+    return (
+      <KeyboardInteractiveDialog
+        isOpen
+        server={server}
+        onClose={handleKeyboardInteractiveClose}
+        onConnected={handleKeyboardInteractiveConnected}
+      />
+    );
+  }
 
   const isKeyAuth = server.auth_type === 'key' || server.auth_type === 'key_with_passphrase';
 
@@ -390,6 +464,30 @@ export function ConnectDialog({ isOpen, server, forceNew = false, onClose, onCon
                 )}
               </button>
             </div>
+          </div>
+
+          {/* Two-factor / keyboard-interactive escape hatch.
+              Servers with `AuthenticationMethods keyboard-interactive` offer
+              neither password nor publickey, so the normal form above can
+              never succeed against them. */}
+          <div className="pt-1">
+            <button
+              type="button"
+              onClick={() => {
+                setError(null);
+                setUseKeyboardInteractive(true);
+              }}
+              disabled={isConnecting}
+              className={cn(
+                'flex items-center gap-2 text-sm',
+                'text-tokyo-purple hover:text-tokyo-fg',
+                'disabled:opacity-50 disabled:cursor-not-allowed',
+                'transition-colors'
+              )}
+            >
+              <ShieldCheck className="w-4 h-4" />
+              Server asks for a 2FA code (keyboard-interactive)
+            </button>
           </div>
 
           {/* Actions */}

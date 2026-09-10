@@ -384,9 +384,9 @@ impl SshClient {
 
         let response = {
             let mut session_guard = self.session.lock().await;
-            let session = session_guard.as_mut().ok_or_else(|| {
-                anyhow!("No keyboard-interactive authentication is in progress")
-            })?;
+            let session = session_guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("No keyboard-interactive authentication is in progress"))?;
             session
                 .authenticate_keyboard_interactive_respond(responses)
                 .await

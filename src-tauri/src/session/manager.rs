@@ -2,12 +2,19 @@ use anyhow::{anyhow, Context, Result};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, RwLock};
+use uuid::Uuid;
 
 use crate::session::{Session, SessionInfo, SessionState};
-use crate::ssh::{PtyConfig, SshClient};
+use crate::ssh::{KeyboardInteractiveOutcome, KeyboardInteractivePrompt, PtyConfig, SshClient};
 use crate::storage::{Database, Server};
+
+/// How long a half-finished keyboard-interactive exchange is kept around while
+/// waiting for the user to type the answers. Matches the inactivity timeout
+/// used by `SshClient::connect_keyboard_interactive`, so both sides give up at
+/// roughly the same moment instead of leaving a dangling registry entry.
+const KEYBOARD_INTERACTIVE_TTL: Duration = Duration::from_secs(300);
 
 /// Credentials for SSH authentication
 #[derive(Debug, Clone)]
@@ -57,8 +64,53 @@ impl SshCredential {
     }
 }
 
+/// A keyboard-interactive exchange that has started but is not finished: the
+/// server asked something and we are waiting for the user's answers.
+///
+/// The SSH connection is already open and half-authenticated, so it has to be
+/// carried across the `start` / `respond` command boundary. `SshClient` is
+/// cheap to clone (it is a bundle of `Arc`s) but the SSH output receiver is
+/// not, which is why the whole thing is owned by the registry and moved out
+/// when the exchange finally succeeds.
+struct PendingKeyboardInteractive {
+    server_name: String,
+    username: String,
+    client: SshClient,
+    output_rx: mpsc::Receiver<Vec<u8>>,
+    pty_config: Option<PtyConfig>,
+    started_at: Instant,
+}
+
+impl PendingKeyboardInteractive {
+    fn is_expired(&self) -> bool {
+        self.started_at.elapsed() >= KEYBOARD_INTERACTIVE_TTL
+    }
+}
+
+/// One step of a keyboard-interactive conversation, as seen by callers of
+/// [`SessionManager`].
+///
+/// This mirrors [`KeyboardInteractiveOutcome`] but carries the ready-to-use
+/// [`Session`] on success, because authenticating is only half the job: the
+/// shell still has to be opened and wired up before the caller can do anything
+/// useful with it.
+pub enum KeyboardInteractiveStep {
+    /// Authentication succeeded and the session is connected and registered.
+    Authenticated(Arc<Session>),
+    /// The server refused the answers. The connection has been discarded.
+    Rejected,
+    /// The server is asking for more input.
+    Prompts {
+        name: String,
+        instructions: String,
+        prompts: Vec<KeyboardInteractivePrompt>,
+    },
+}
+
 pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<String, Arc<Session>>>>,
+    /// Keyboard-interactive exchanges waiting for user input, keyed by auth id.
+    pending_keyboard_interactive: Arc<RwLock<HashMap<String, PendingKeyboardInteractive>>>,
     database: Arc<Database>,
 }
 
@@ -66,6 +118,7 @@ impl SessionManager {
     pub fn new(database: Arc<Database>) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            pending_keyboard_interactive: Arc::new(RwLock::new(HashMap::new())),
             database,
         }
     }
@@ -701,6 +754,358 @@ impl SessionManager {
         Ok(())
     }
 
+    // === Keyboard-interactive (RFC 4256) ===
+    //
+    // Two-factor servers (`AuthenticationMethods keyboard-interactive`) offer
+    // neither `password` nor `publickey`, and drive a multi-prompt
+    // conversation instead. Nothing about it can be stored: a TOTP code is
+    // valid for 30 seconds. So the exchange is started, parked in a registry,
+    // and resumed once the user has typed the answers.
+
+    /// Start a keyboard-interactive exchange for a saved server.
+    ///
+    /// Returns the id identifying this exchange plus the first step. When the
+    /// step is [`KeyboardInteractiveStep::Prompts`], answer it with
+    /// [`Self::respond_keyboard_interactive`] using the returned id.
+    pub async fn start_keyboard_interactive(
+        &self,
+        server_name: &str,
+        pty_config: Option<PtyConfig>,
+    ) -> Result<(String, KeyboardInteractiveStep)> {
+        self.reap_expired_keyboard_interactive().await;
+
+        let server = self
+            .database
+            .server_get_by_name(server_name)?
+            .ok_or_else(|| {
+                error!("[SessionManager] Server not found: {}", server_name);
+                anyhow!("Server not found: {}", server_name)
+            })?;
+
+        // A jump host would need the bridge to stay alive across the whole
+        // conversation, which the current bridge task cannot do. Fail loudly
+        // instead of opening a connection that cannot be completed.
+        if server.jump_host_id.is_some() {
+            return Err(anyhow!(
+                "Keyboard-interactive authentication through a jump host is not supported yet \
+                 (server '{}')",
+                server_name
+            ));
+        }
+
+        info!(
+            "[SessionManager] Starting keyboard-interactive authentication for {}@{}:{}",
+            server.username, server.host, server.port
+        );
+
+        let (ssh_output_tx, ssh_output_rx) = mpsc::channel::<Vec<u8>>(256);
+        let mut client = SshClient::new(ssh_output_tx);
+
+        let outcome = client
+            .connect_keyboard_interactive(&server.host, server.port, &server.username, None)
+            .await?;
+
+        let auth_id = Uuid::new_v4().to_string();
+
+        match outcome {
+            KeyboardInteractiveOutcome::Authenticated => {
+                // Some servers accept straight away (for example when the
+                // module is satisfied by something other than a prompt).
+                let session = self
+                    .finalize_keyboard_interactive_session(
+                        &server,
+                        client,
+                        ssh_output_rx,
+                        pty_config,
+                    )
+                    .await?;
+                Ok((auth_id, KeyboardInteractiveStep::Authenticated(session)))
+            }
+            KeyboardInteractiveOutcome::Rejected => {
+                Ok((auth_id, KeyboardInteractiveStep::Rejected))
+            }
+            KeyboardInteractiveOutcome::Prompts {
+                name,
+                instructions,
+                prompts,
+            } => {
+                let pending = PendingKeyboardInteractive {
+                    server_name: server.name.clone(),
+                    username: server.username.clone(),
+                    client,
+                    output_rx: ssh_output_rx,
+                    pty_config,
+                    started_at: Instant::now(),
+                };
+                self.pending_keyboard_interactive
+                    .write()
+                    .await
+                    .insert(auth_id.clone(), pending);
+
+                debug!(
+                    "[SessionManager] Keyboard-interactive exchange {} parked with {} prompt(s)",
+                    auth_id,
+                    prompts.len()
+                );
+
+                Ok((
+                    auth_id,
+                    KeyboardInteractiveStep::Prompts {
+                        name,
+                        instructions,
+                        prompts,
+                    },
+                ))
+            }
+        }
+    }
+
+    /// Answer one round of prompts. The server may reply with more prompts, in
+    /// which case this must be called again with the same `auth_id`.
+    pub async fn respond_keyboard_interactive(
+        &self,
+        auth_id: &str,
+        responses: Vec<String>,
+    ) -> Result<KeyboardInteractiveStep> {
+        self.reap_expired_keyboard_interactive().await;
+
+        // Take ownership: the entry is only put back if the conversation is
+        // still going. Any error or terminal answer therefore drops the
+        // half-authenticated connection instead of leaking it.
+        let mut pending = self
+            .pending_keyboard_interactive
+            .write()
+            .await
+            .remove(auth_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "No keyboard-interactive authentication in progress for '{}' \
+                     (it may have expired after {}s)",
+                    auth_id,
+                    KEYBOARD_INTERACTIVE_TTL.as_secs()
+                )
+            })?;
+
+        let username = pending.username.clone();
+        let outcome = pending
+            .client
+            .keyboard_interactive_respond(&username, responses)
+            .await?;
+
+        match outcome {
+            KeyboardInteractiveOutcome::Authenticated => {
+                let server = self
+                    .database
+                    .server_get_by_name(&pending.server_name)?
+                    .ok_or_else(|| anyhow!("Server not found: {}", pending.server_name))?;
+
+                let session = self
+                    .finalize_keyboard_interactive_session(
+                        &server,
+                        pending.client,
+                        pending.output_rx,
+                        pending.pty_config,
+                    )
+                    .await?;
+
+                info!(
+                    "[SessionManager] Keyboard-interactive exchange {} authenticated, session {}",
+                    auth_id, session.id
+                );
+                Ok(KeyboardInteractiveStep::Authenticated(session))
+            }
+            KeyboardInteractiveOutcome::Rejected => {
+                warn!(
+                    "[SessionManager] Keyboard-interactive exchange {} rejected by server",
+                    auth_id
+                );
+                Ok(KeyboardInteractiveStep::Rejected)
+            }
+            KeyboardInteractiveOutcome::Prompts {
+                name,
+                instructions,
+                prompts,
+            } => {
+                debug!(
+                    "[SessionManager] Keyboard-interactive exchange {} continues with {} prompt(s)",
+                    auth_id,
+                    prompts.len()
+                );
+                pending.started_at = Instant::now();
+                self.pending_keyboard_interactive
+                    .write()
+                    .await
+                    .insert(auth_id.to_string(), pending);
+
+                Ok(KeyboardInteractiveStep::Prompts {
+                    name,
+                    instructions,
+                    prompts,
+                })
+            }
+        }
+    }
+
+    /// Abandon an exchange, e.g. when the user closes the prompt dialog.
+    /// Unknown or already-finished ids are not an error.
+    pub async fn cancel_keyboard_interactive(&self, auth_id: &str) -> Result<()> {
+        let pending = self
+            .pending_keyboard_interactive
+            .write()
+            .await
+            .remove(auth_id);
+
+        if let Some(mut pending) = pending {
+            info!(
+                "[SessionManager] Cancelling keyboard-interactive exchange {}",
+                auth_id
+            );
+            if let Err(e) = pending.client.disconnect().await {
+                debug!(
+                    "[SessionManager] Error disconnecting cancelled exchange {}: {}",
+                    auth_id, e
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Number of exchanges currently waiting for user input.
+    pub async fn pending_keyboard_interactive_count(&self) -> usize {
+        self.pending_keyboard_interactive.read().await.len()
+    }
+
+    /// Drop exchanges the user never answered, so an abandoned dialog does not
+    /// keep a half-authenticated SSH connection open forever.
+    async fn reap_expired_keyboard_interactive(&self) {
+        let expired: Vec<String> = {
+            let pending = self.pending_keyboard_interactive.read().await;
+            pending
+                .iter()
+                .filter(|(_, entry)| entry.is_expired())
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+
+        for auth_id in expired {
+            info!(
+                "[SessionManager] Reaping expired keyboard-interactive exchange {}",
+                auth_id
+            );
+            let _ = self.cancel_keyboard_interactive(&auth_id).await;
+        }
+    }
+
+    /// Open the shell on an authenticated connection and register the session.
+    ///
+    /// This mirrors the tail of [`Self::create_with_credentials`]. It is kept
+    /// separate on purpose: the password and key paths are untouched by the
+    /// 2FA work, so they keep their existing, already-shipped code path.
+    async fn finalize_keyboard_interactive_session(
+        &self,
+        server: &Server,
+        mut ssh_client: SshClient,
+        mut ssh_output_rx: mpsc::Receiver<Vec<u8>>,
+        pty_config: Option<PtyConfig>,
+    ) -> Result<Arc<Session>> {
+        let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (output_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
+
+        let session = Arc::new(Session::new(
+            server.id.clone(),
+            server.name.clone(),
+            input_tx,
+            output_tx,
+        ));
+
+        info!(
+            "[SessionManager] Keyboard-interactive authentication done, opening shell for session {}",
+            session.id
+        );
+        ssh_client.open_shell(pty_config).await?;
+
+        session.set_ssh_client(ssh_client).await;
+        session.set_state(SessionState::Connected).await;
+
+        // Bridge SSH output to the session broadcast channel.
+        let session_for_output = session.clone();
+        let session_id_for_output = session.id.clone();
+        tokio::spawn(async move {
+            debug!(
+                "[SessionManager] Output bridge task started for session {}",
+                session_id_for_output
+            );
+            while let Some(data) = ssh_output_rx.recv().await {
+                session_for_output.publish_output(data).await;
+            }
+            debug!(
+                "[SessionManager] Output bridge task ended for session {}",
+                session_id_for_output
+            );
+        });
+
+        // Bridge the input channel to SSH stdin.
+        let session_for_input = session.clone();
+        let session_id_for_input = session.id.clone();
+        tokio::spawn(async move {
+            debug!(
+                "[SessionManager] Input bridge task started for session {}",
+                session_id_for_input
+            );
+            while let Some(data) = input_rx.recv().await {
+                if let Err(e) = session_for_input.write_to_ssh(&data).await {
+                    error!(
+                        "[SessionManager] Error writing to SSH for session {}: {}",
+                        session_id_for_input, e
+                    );
+                    break;
+                }
+            }
+            debug!(
+                "[SessionManager] Input bridge task ended for session {}",
+                session_id_for_input
+            );
+        });
+
+        if let Some(ref cmd) = server.post_login_command {
+            if !cmd.trim().is_empty() {
+                let session_for_cmd = session.clone();
+                let cmd_str = cmd.clone();
+                let sid = session.id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                    let cmd_with_newline = format!("{}\n", cmd_str);
+                    if let Err(e) = session_for_cmd
+                        .write_to_ssh(cmd_with_newline.as_bytes())
+                        .await
+                    {
+                        warn!(
+                            "[SessionManager] Failed to send post-login command for session {}: {}",
+                            sid, e
+                        );
+                    } else {
+                        info!(
+                            "[SessionManager] Sent post-login command for session {}: {}",
+                            sid, cmd_str
+                        );
+                    }
+                });
+            }
+        }
+
+        self.sessions
+            .write()
+            .await
+            .insert(session.id.clone(), session.clone());
+
+        info!(
+            "[SessionManager] Session {} ready and connected (keyboard-interactive)",
+            session.id
+        );
+        Ok(session)
+    }
+
     pub async fn kill(&self, id: &str) -> Result<()> {
         info!("[SessionManager] Killing session {}", id);
         let mut sessions = self.sessions.write().await;
@@ -776,6 +1181,42 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("Ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unknown_keyboard_interactive_exchange_is_not_an_error() {
+        let manager = manager_with_ids(&[]).await;
+        assert_eq!(manager.pending_keyboard_interactive_count().await, 0);
+
+        // The dialog can be closed after the exchange already finished, so an
+        // unknown id has to be a no-op rather than an error the UI must handle.
+        manager
+            .cancel_keyboard_interactive("no-such-exchange")
+            .await
+            .unwrap();
+
+        assert_eq!(manager.pending_keyboard_interactive_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn responding_without_a_started_exchange_is_reported_clearly() {
+        let manager = manager_with_ids(&[]).await;
+
+        let error = match manager
+            .respond_keyboard_interactive("no-such-exchange", vec!["123456".to_string()])
+            .await
+        {
+            Ok(_) => panic!("responding to an unknown exchange should fail"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(
+            error.contains("No keyboard-interactive authentication in progress"),
+            "unexpected error: {error}"
+        );
+        // The message has to mention the expiry, because that is the most
+        // likely reason an id stops being known.
+        assert!(error.contains("expired"), "unexpected error: {error}");
     }
 
     #[test]

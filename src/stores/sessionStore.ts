@@ -4,6 +4,7 @@ import { useNotificationStore } from './notificationStore';
 import { useFileWorkspaceStore } from './fileWorkspaceStore';
 import { usePluginWorkspaceStore } from './pluginWorkspaceStore';
 import type { CodingAgentLaunchRequest } from '../types/codingAgent';
+import type { KeyboardInteractiveStep } from '../types/keyboardInteractive';
 
 /**
  * Helper to show error notification
@@ -166,6 +167,25 @@ interface SessionStore {
     rows?: number,
     forceNew?: boolean
   ) => Promise<Session | null>;
+  /**
+   * Start keyboard-interactive (RFC 4256 / 2FA) authentication for a server.
+   * Returns the first step of the conversation, or null if the command failed.
+   */
+  startKeyboardInteractive: (
+    serverName: string,
+    cols?: number,
+    rows?: number
+  ) => Promise<KeyboardInteractiveStep | null>;
+  /**
+   * Answer one round of keyboard-interactive prompts. The server may reply
+   * with further prompts, in which case call this again with the same authId.
+   */
+  respondKeyboardInteractive: (
+    authId: string,
+    responses: string[]
+  ) => Promise<KeyboardInteractiveStep | null>;
+  /** Abandon an in-flight keyboard-interactive exchange. */
+  cancelKeyboardInteractive: (authId: string) => Promise<void>;
   /** Attach to an existing session and start receiving output */
   attachSession: (sessionId: string) => Promise<boolean>;
   /** Attach to a local shell session (replays buffered output) */
@@ -387,6 +407,83 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       showError('Connection Failed', result.error);
       return null;
     }
+  },
+
+  startKeyboardInteractive: async (serverName: string, cols?: number, rows?: number) => {
+    set({ loading: true, error: null });
+
+    const result = await safeInvoke<KeyboardInteractiveStep>(
+      'session_keyboard_interactive_start',
+      {
+        request: {
+          serverName,
+          cols: cols ?? 80,
+          rows: rows ?? 24,
+        },
+      }
+    );
+
+    if (!result.success) {
+      set({ error: result.error.message, loading: false });
+      showError('Connection Failed', result.error);
+      return null;
+    }
+
+    const step = result.data;
+    if (step.kind === 'authenticated') {
+      const session = mapSessionInfo(step.session);
+      set((state) => ({
+        sessions: upsertSession(state.sessions, session),
+        activeSessionId: state.activeSessionId ?? session.id,
+        loading: false,
+      }));
+    } else {
+      set({ loading: false });
+    }
+
+    return step;
+  },
+
+  respondKeyboardInteractive: async (authId: string, responses: string[]) => {
+    set({ loading: true, error: null });
+
+    const result = await safeInvoke<KeyboardInteractiveStep>(
+      'session_keyboard_interactive_respond',
+      {
+        request: {
+          authId,
+          responses,
+        },
+      }
+    );
+
+    if (!result.success) {
+      set({ error: result.error.message, loading: false });
+      showError('Authentication Failed', result.error);
+      return null;
+    }
+
+    const step = result.data;
+    if (step.kind === 'authenticated') {
+      const session = mapSessionInfo(step.session);
+      set((state) => ({
+        sessions: upsertSession(state.sessions, session),
+        activeSessionId: state.activeSessionId ?? session.id,
+        loading: false,
+      }));
+    } else {
+      set({ loading: false });
+    }
+
+    return step;
+  },
+
+  cancelKeyboardInteractive: async (authId: string) => {
+    // Best effort: the backend treats unknown ids as a no-op, and a failure
+    // here must never block the UI from closing the dialog.
+    await safeInvoke('session_keyboard_interactive_cancel', {
+      request: { authId },
+    });
   },
 
   attachSession: async (sessionId: string) => {
