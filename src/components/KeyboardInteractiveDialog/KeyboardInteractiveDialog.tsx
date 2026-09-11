@@ -79,6 +79,19 @@ export function KeyboardInteractiveDialog({
 
       setName(step.name);
       setInstructions(step.instructions);
+
+      if (step.prompts.length === 0) {
+        // The backend answers message-only rounds (RFC 4256 allows an info
+        // request with no prompts) on its own, so this should be unreachable.
+        // Fail visibly rather than render a dialog with no fields and a
+        // permanently disabled button, which is indistinguishable from a hang.
+        setPrompts([]);
+        setAnswers([]);
+        setRevealed([]);
+        setError('The server sent nothing to answer. Close the dialog and try again.');
+        return;
+      }
+
       setPrompts(step.prompts);
       setAnswers(step.prompts.map(() => ''));
       setRevealed(step.prompts.map(() => false));

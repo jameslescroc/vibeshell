@@ -53,6 +53,23 @@ pub enum KeyboardInteractiveOutcome {
     },
 }
 
+/// Accumulate text the server sent across several keyboard-interactive rounds.
+///
+/// A message-only round is answered without asking the user anything, but its
+/// text still matters (PAM warnings, password expiry). It is kept and shown
+/// with the next real prompt instead of being dropped. Blank and duplicate
+/// fragments are ignored so the dialog does not fill up with noise.
+fn append_server_text(accumulated: &mut String, addition: &str) {
+    let addition = addition.trim();
+    if addition.is_empty() || accumulated.contains(addition) {
+        return;
+    }
+    if !accumulated.is_empty() {
+        accumulated.push('\n');
+    }
+    accumulated.push_str(addition);
+}
+
 #[derive(Clone)]
 pub struct SshClient {
     session: Arc<Mutex<Option<client::Handle<ClientHandler>>>>,
@@ -404,51 +421,118 @@ impl SshClient {
 
     /// Translate a russh response into our serializable outcome, dropping the
     /// session when the server rejects the attempt.
+    ///
+    /// RFC 4256 lets the server send an info request carrying **zero prompts**.
+    /// That is not a question: it is a one-way message (a PAM banner, a
+    /// "code accepted" notice, a password-expiry warning), and the protocol
+    /// requires the client to acknowledge it with an empty response before the
+    /// exchange can continue. Handing such a round to the UI would render a
+    /// dialog with no fields and no way to move forward, so those rounds are
+    /// answered here and never surfaced as prompts.
+    ///
+    /// Any text the server attached to a message-only round is carried over
+    /// and shown with the next real prompt, so warnings are not swallowed.
     async fn handle_keyboard_interactive_response(
         &mut self,
         response: client::KeyboardInteractiveAuthResponse,
         username: &str,
     ) -> Result<KeyboardInteractiveOutcome> {
-        match response {
-            client::KeyboardInteractiveAuthResponse::Success => {
-                info!(
-                    "[SSH] Keyboard-interactive authentication successful for user '{}'",
-                    username
-                );
-                Ok(KeyboardInteractiveOutcome::Authenticated)
-            }
-            client::KeyboardInteractiveAuthResponse::Failure => {
-                error!(
-                    "[SSH] Keyboard-interactive authentication rejected for user '{}'",
-                    username
-                );
-                // Discard the unusable session so a retry starts from scratch.
-                let mut session_guard = self.session.lock().await;
-                *session_guard = None;
-                Ok(KeyboardInteractiveOutcome::Rejected)
-            }
-            client::KeyboardInteractiveAuthResponse::InfoRequest {
-                name,
-                instructions,
-                prompts,
-            } => {
-                debug!(
-                    "[SSH] Server sent {} keyboard-interactive prompt(s)",
-                    prompts.len()
-                );
-                Ok(KeyboardInteractiveOutcome::Prompts {
+        // A server that only ever answers with empty info requests would spin
+        // forever; bound the number of consecutive message-only rounds.
+        const MAX_MESSAGE_ONLY_ROUNDS: usize = 16;
+
+        let mut response = response;
+        let mut carried_name = String::new();
+        let mut carried_instructions = String::new();
+
+        for _ in 0..=MAX_MESSAGE_ONLY_ROUNDS {
+            match response {
+                client::KeyboardInteractiveAuthResponse::Success => {
+                    info!(
+                        "[SSH] Keyboard-interactive authentication successful for user '{}'",
+                        username
+                    );
+                    return Ok(KeyboardInteractiveOutcome::Authenticated);
+                }
+                client::KeyboardInteractiveAuthResponse::Failure => {
+                    error!(
+                        "[SSH] Keyboard-interactive authentication rejected for user '{}'",
+                        username
+                    );
+                    // Discard the unusable session so a retry starts from scratch.
+                    let mut session_guard = self.session.lock().await;
+                    *session_guard = None;
+                    return Ok(KeyboardInteractiveOutcome::Rejected);
+                }
+                client::KeyboardInteractiveAuthResponse::InfoRequest {
                     name,
                     instructions,
-                    prompts: prompts
-                        .into_iter()
-                        .map(|prompt| KeyboardInteractivePrompt {
-                            prompt: prompt.prompt,
-                            echo: prompt.echo,
-                        })
-                        .collect(),
-                })
+                    prompts,
+                } if prompts.is_empty() => {
+                    debug!(
+                        "[SSH] Server sent a message-only keyboard-interactive round \
+                         (name: {:?}, instructions: {:?}); acknowledging with an empty response",
+                        name, instructions
+                    );
+
+                    append_server_text(&mut carried_name, &name);
+                    append_server_text(&mut carried_instructions, &instructions);
+
+                    response = {
+                        let mut session_guard = self.session.lock().await;
+                        let session = session_guard.as_mut().ok_or_else(|| {
+                            anyhow!("No keyboard-interactive authentication is in progress")
+                        })?;
+                        session
+                            .authenticate_keyboard_interactive_respond(Vec::new())
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Keyboard-interactive authentication failed for user '{}'",
+                                    username
+                                )
+                            })?
+                    };
+                }
+                client::KeyboardInteractiveAuthResponse::InfoRequest {
+                    name,
+                    instructions,
+                    prompts,
+                } => {
+                    debug!(
+                        "[SSH] Server sent {} keyboard-interactive prompt(s)",
+                        prompts.len()
+                    );
+
+                    append_server_text(&mut carried_name, &name);
+                    append_server_text(&mut carried_instructions, &instructions);
+
+                    return Ok(KeyboardInteractiveOutcome::Prompts {
+                        name: carried_name,
+                        instructions: carried_instructions,
+                        prompts: prompts
+                            .into_iter()
+                            .map(|prompt| KeyboardInteractivePrompt {
+                                prompt: prompt.prompt,
+                                echo: prompt.echo,
+                            })
+                            .collect(),
+                    });
+                }
             }
         }
+
+        // Drop the session: it is stuck mid-authentication and unusable.
+        {
+            let mut session_guard = self.session.lock().await;
+            *session_guard = None;
+        }
+        Err(anyhow!(
+            "Server sent more than {} keyboard-interactive messages without asking anything \
+             for user '{}'",
+            MAX_MESSAGE_ONLY_ROUNDS,
+            username
+        ))
     }
 
     pub async fn connect_key(
@@ -862,5 +946,38 @@ impl SshClient {
         );
 
         Ok(output_str)
+    }
+}
+
+#[cfg(test)]
+mod keyboard_interactive_text_tests {
+    use super::append_server_text;
+
+    #[test]
+    fn blank_fragments_are_ignored() {
+        let mut text = String::new();
+        append_server_text(&mut text, "   ");
+        append_server_text(&mut text, "");
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn fragments_from_successive_rounds_are_joined() {
+        let mut text = String::new();
+        append_server_text(&mut text, "Verification code accepted.");
+        append_server_text(&mut text, "Your password expires in 3 days.");
+        assert_eq!(
+            text,
+            "Verification code accepted.\nYour password expires in 3 days."
+        );
+    }
+
+    #[test]
+    fn a_repeated_fragment_is_not_shown_twice() {
+        // Servers often resend the same banner on every round.
+        let mut text = String::new();
+        append_server_text(&mut text, "Two-factor authentication");
+        append_server_text(&mut text, "Two-factor authentication");
+        assert_eq!(text, "Two-factor authentication");
     }
 }
