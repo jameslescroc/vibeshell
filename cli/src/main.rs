@@ -200,6 +200,14 @@ enum Commands {
     /// Kill/terminate session(s)
     Kill(KillArgs),
 
+    /// Serve MCP over stdin/stdout, bridged to the desktop Agent Gateway
+    ///
+    /// Configure this as an MCP server command in an AI tool. The endpoint is
+    /// resolved from VibeShell's manifest on every call, so it keeps working
+    /// after VibeShell restarts on a different port with a new token, which a
+    /// hardcoded URL cannot do.
+    Mcp,
+
     /// Manage the headless background service used by terminal workflows
     #[command(long_about = "Inspect or start the VibeShell headless daemon.\n\n\
         SSH, SFTP, session listing, attach, and kill commands can auto-start this service,\n\
@@ -529,6 +537,7 @@ fn main() -> Result<()> {
         Some(Commands::Import(args)) => {
             commands::import::run(args.source.into(), args.path, args.dry_run, args.json)
         }
+        Some(Commands::Mcp) => commands::mcp::run(),
         Some(Commands::Sessions) => commands::session::list(),
         Some(Commands::Attach(args)) => {
             let resolved =

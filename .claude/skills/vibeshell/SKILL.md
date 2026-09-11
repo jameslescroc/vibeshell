@@ -1,6 +1,6 @@
 ---
 name: vibeshell
-description: Use the native VibeShell CLI to manage saved SSH servers, persistent sessions, remote commands, SFTP transfers, remote files, and SSH configuration imports without requiring the desktop UI.
+description: Use the native VibeShell CLI to manage saved SSH servers, persistent sessions, remote commands, SFTP transfers, remote files, and SSH configuration imports without requiring the desktop UI. Covers servers that refuse stored credentials and require a two-factor, keyboard-interactive one-time code.
 ---
 
 # VibeShell
@@ -86,6 +86,42 @@ vibeshell send-key 001 yes enter
 vibeshell send-key 001 ctrl-c
 ```
 
+## Two-factor servers (keyboard-interactive)
+
+Some servers accept neither a password nor a key. They run a keyboard-interactive
+exchange and ask for a one-time code, which no saved credential can answer. On
+those, `vibeshell ssh <server>` reports `No saved credentials for server
+'<name>'` even though the profile looks complete.
+
+Do not fall back to `ssh`, and never place a code on a command line: it would be
+written to shell history.
+
+In a real terminal, `vibeshell ssh <server>` drives the exchange itself and asks
+for each answer, hiding the ones the server marks as secret.
+
+Without a terminal, which is the normal case here, the CLI declines instead of
+blocking on input that can never arrive. Say so plainly and ask the user to run
+this once themselves:
+
+```bash
+vibeshell ssh <server>
+```
+
+Then work with the session it leaves behind, like any other:
+
+```bash
+vibeshell sessions
+vibeshell ssh-session <alias> -- uptime
+```
+
+Such a session is kept until it is closed or the daemon stops. It is exempt from
+the idle timeout, because rebuilding it costs the user another code.
+
+If the server asks for a password as well as a code, ask the user to save that
+password in the VibeShell desktop app. It is then answered automatically and only
+the code remains to type. Never request a long-lived password in conversation; a
+one-time code is different, since it expires within about thirty seconds.
+
 ## Remote search and files
 
 Search remotely with ripgrep-style output:
@@ -133,4 +169,5 @@ vibeshell sftp <server>
 - Treat `--new`, remote deletion, overwrites, recursive uploads, and sync deletion as deliberate actions.
 - Keep secrets local. Do not request private-key text or passwords when an imported/saved profile should provide authentication.
 - Report the server name, session alias, command exit status, and relevant output. Do not claim success from command submission alone.
+- A connection failure is not the end of the answer. Say which step failed, and what the user can do about it: save a credential, or authenticate a two-factor server once in their own terminal.
 - Use `vibeshell daemon status` for diagnostics. The daemon is native and does not require the desktop application.

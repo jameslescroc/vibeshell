@@ -6832,6 +6832,7 @@ dependencies = [
  "clap",
  "crossterm",
  "interprocess",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
