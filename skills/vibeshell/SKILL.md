@@ -1,6 +1,6 @@
 ---
 name: vibeshell
-description: Use the native VibeShell CLI to manage saved SSH servers, persistent sessions, remote commands, SFTP transfers, remote files, and SSH configuration imports without requiring the desktop UI.
+description: Use the native VibeShell CLI to manage saved SSH servers, persistent sessions, remote commands, SFTP transfers, remote files, and SSH configuration imports without requiring the desktop UI. Covers servers that refuse stored credentials and require a two-factor, keyboard-interactive one-time code.
 ---
 
 # VibeShell
