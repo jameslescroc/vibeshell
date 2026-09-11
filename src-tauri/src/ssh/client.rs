@@ -18,7 +18,11 @@ pub struct ServerKeyInfo {
 }
 
 /// A single prompt sent by the server during keyboard-interactive authentication.
-#[derive(Debug, Clone, serde::Serialize)]
+///
+/// `Deserialize` is required as well as `Serialize`: prompts travel to the UI
+/// over Tauri, but also to the CLI over the IPC socket, which has to read them
+/// back on the other side.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyboardInteractivePrompt {
     /// Label to display, e.g. `"Verification code: "`.

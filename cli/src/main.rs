@@ -8,6 +8,7 @@ mod command_input;
 mod commands;
 mod daemon;
 mod ipc_support;
+mod keyboard_interactive;
 mod session_alias;
 mod terminal;
 

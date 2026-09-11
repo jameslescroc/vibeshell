@@ -12,6 +12,7 @@ use anyhow::{bail, Result};
 use vibeshell_core::ipc::{IpcMessage, IpcSessionInfo};
 
 use crate::ipc_support;
+use crate::keyboard_interactive;
 use crate::session_alias;
 use crate::terminal;
 
@@ -141,6 +142,24 @@ fn create_session_with_retry(server_name: &str, wait: bool) -> Result<String> {
             Ok(IpcMessage::SessionCreated { session_id }) => return Ok(session_id),
             Ok(IpcMessage::Error { message }) => {
                 last_error = message;
+
+                // A stored credential is useless against a server that only
+                // offers keyboard-interactive: the answer is a code valid for
+                // seconds. Offer the interactive path before giving up, so the
+                // human can authenticate once and leave a reusable session
+                // behind.
+                match keyboard_interactive::authenticate(server_name) {
+                    Ok(Some(session_id)) => return Ok(session_id),
+                    Ok(None) => {}
+                    Err(error) => bail!(
+                        "Error connecting to server '{}': {}\nTwo-factor authentication also \
+                         failed: {}",
+                        server_name,
+                        last_error,
+                        error
+                    ),
+                }
+
                 if !wait {
                     bail!(
                         "Error connecting to server '{}': {}",

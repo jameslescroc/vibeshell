@@ -23,7 +23,7 @@ use interprocess::os::windows::security_descriptor::{
 };
 
 use crate::commands::sftp::{SftpEntry, SftpFileContent};
-use crate::session::SessionManager;
+use crate::session::{KeyboardInteractiveStep, SessionManager};
 use crate::sftp::helpers::{
     resolve_remote_path, resolve_remote_upload_path, sftp_delete_path, sftp_mkdir_recursive,
     write_remote_file, write_remote_file_with_options, WriteRemoteFileOptions,
@@ -32,6 +32,7 @@ use crate::sftp::{
     effective_directory_transfer_options, transfer_directory_to_sftp, DirectoryTransferMode,
     DirectoryTransferSummary, TransferProgress,
 };
+use crate::ssh::KeyboardInteractivePrompt;
 use crate::storage::{AuthType, Database};
 
 const DEFAULT_SOCKET_NAME: &str = "vibeshell.sock";
@@ -128,6 +129,25 @@ pub enum IpcMessage {
         cols: Option<u32>,
         rows: Option<u32>,
     },
+    /// Start keyboard-interactive (RFC 4256 / 2FA) authentication for a server.
+    ///
+    /// Servers that only offer `keyboard-interactive` cannot be reached with a
+    /// stored credential: the answer is a code that expires in seconds. The
+    /// caller drives a conversation instead, and a human types the answers.
+    StartKeyboardInteractive {
+        server_name: String,
+        cols: Option<u32>,
+        rows: Option<u32>,
+    },
+    /// Answer one round of keyboard-interactive prompts. The server may reply
+    /// with further prompts, in which case send this again with the same id.
+    RespondKeyboardInteractive {
+        auth_id: String,
+        responses: Vec<String>,
+    },
+    /// Abandon an in-flight keyboard-interactive exchange, closing the
+    /// half-authenticated connection.
+    CancelKeyboardInteractive { auth_id: String },
     /// Attach to an existing session (starts streaming output)
     AttachSession { session_id: String },
     /// Detach from a session (keeps it running)
@@ -250,6 +270,19 @@ pub enum IpcMessage {
     SftpTransfer { progress: TransferProgress },
     /// SFTP directory transfer response
     SftpDirectoryTransfer { summary: DirectoryTransferSummary },
+    /// The server is asking for input to finish keyboard-interactive
+    /// authentication. Answer with `RespondKeyboardInteractive`, one response
+    /// per prompt, in order. A prompt with `echo == false` must not be shown
+    /// on screen as it is typed.
+    KeyboardInteractivePrompts {
+        auth_id: String,
+        name: String,
+        instructions: String,
+        prompts: Vec<KeyboardInteractivePrompt>,
+    },
+    /// The server refused the keyboard-interactive answers. The connection has
+    /// been discarded; retrying means starting a new exchange.
+    KeyboardInteractiveRejected,
     /// Error response
     Error { message: String },
     /// Success acknowledgment
@@ -261,6 +294,31 @@ pub enum IpcMessage {
 type SocketName = interprocess::local_socket::Name<'static>;
 #[cfg(not(windows))]
 type SocketName = interprocess::local_socket::Name<'static>;
+
+/// Translate one step of a keyboard-interactive conversation into the reply the
+/// CLI expects.
+///
+/// Success is reported as `SessionCreated`, exactly like the password and key
+/// paths, so callers that already know how to use a session id do not need a
+/// second code path once authentication is done.
+fn keyboard_interactive_step_to_ipc(auth_id: String, step: KeyboardInteractiveStep) -> IpcMessage {
+    match step {
+        KeyboardInteractiveStep::Authenticated(session) => IpcMessage::SessionCreated {
+            session_id: session.id.clone(),
+        },
+        KeyboardInteractiveStep::Rejected => IpcMessage::KeyboardInteractiveRejected,
+        KeyboardInteractiveStep::Prompts {
+            name,
+            instructions,
+            prompts,
+        } => IpcMessage::KeyboardInteractivePrompts {
+            auth_id,
+            name,
+            instructions,
+            prompts,
+        },
+    }
+}
 
 /// Get the platform-specific socket name/path.
 ///
@@ -780,6 +838,7 @@ impl IpcServer {
     }
 
     /// Handle an IPC message and return a response
+    #[allow(clippy::too_many_lines)]
     fn handle_message(
         message: IpcMessage,
         database: Arc<Database>,
@@ -866,26 +925,66 @@ impl IpcServer {
                             },
                         }
                     }
-                    std::result::Result::Ok(None) => {
-                        match rt.block_on(session_manager.create_by_name(&server_name)) {
-                            std::result::Result::Ok(session) => IpcMessage::SessionCreated {
-                                session_id: session.id.clone(),
-                            },
-                            Err(e) => IpcMessage::Error {
-                                message: format!(
-                                    "No saved credentials for server '{}'. \
-                                     Please save credentials in the VibeShell GUI first, \
-                                     or connect through the GUI. ({})",
-                                    server_name, e
-                                ),
-                            },
-                        }
-                    }
+                    // Without a credential there is nothing to authenticate
+                    // with. Registering a session anyway would leave it stuck
+                    // in `connecting` forever and make the caller believe it
+                    // had connected, so report the failure instead.
+                    std::result::Result::Ok(None) => IpcMessage::Error {
+                        message: format!(
+                            "No saved credentials for server '{}'. Save credentials in the \
+                             VibeShell GUI first, or authenticate interactively if the server \
+                             uses two-factor (keyboard-interactive).",
+                            server_name
+                        ),
+                    },
                     Err(e) => IpcMessage::Error {
                         message: format!(
                             "Failed to look up credentials for '{}': {}",
                             server_name, e
                         ),
+                    },
+                }
+            }
+            IpcMessage::StartKeyboardInteractive {
+                server_name,
+                cols,
+                rows,
+            } => {
+                let pty_config = Some(crate::ssh::PtyConfig {
+                    term: "xterm-256color".to_string(),
+                    cols: cols.unwrap_or(80),
+                    rows: rows.unwrap_or(24),
+                    pix_width: 0,
+                    pix_height: 0,
+                });
+
+                match rt
+                    .block_on(session_manager.start_keyboard_interactive(&server_name, pty_config))
+                {
+                    std::result::Result::Ok((auth_id, step)) => {
+                        keyboard_interactive_step_to_ipc(auth_id, step)
+                    }
+                    Err(e) => IpcMessage::Error {
+                        message: format!(
+                            "Keyboard-interactive authentication to '{}' failed: {}",
+                            server_name, e
+                        ),
+                    },
+                }
+            }
+            IpcMessage::RespondKeyboardInteractive { auth_id, responses } => match rt
+                .block_on(session_manager.respond_keyboard_interactive(&auth_id, responses))
+            {
+                std::result::Result::Ok(step) => keyboard_interactive_step_to_ipc(auth_id, step),
+                Err(e) => IpcMessage::Error {
+                    message: format!("Keyboard-interactive authentication failed: {}", e),
+                },
+            },
+            IpcMessage::CancelKeyboardInteractive { auth_id } => {
+                match rt.block_on(session_manager.cancel_keyboard_interactive(&auth_id)) {
+                    std::result::Result::Ok(()) => IpcMessage::Ok,
+                    Err(e) => IpcMessage::Error {
+                        message: format!("Failed to cancel authentication: {}", e),
                     },
                 }
             }
@@ -2101,5 +2200,85 @@ mod tests {
     fn test_windows_permission_denied_listener_error_is_not_recoverable() {
         let err = io::Error::from_raw_os_error(5);
         assert!(!is_recoverable_listener_error(&err));
+    }
+
+    /// The daemon serializes prompts and the CLI reads them back on the other
+    /// side of the socket. If `echo` did not survive that round trip, a
+    /// password would be echoed to the terminal as it is typed.
+    #[test]
+    fn keyboard_interactive_prompts_survive_the_socket_round_trip() {
+        let message = IpcMessage::KeyboardInteractivePrompts {
+            auth_id: "auth-1".to_string(),
+            name: "Two-factor".to_string(),
+            instructions: "Enter your code".to_string(),
+            prompts: vec![
+                KeyboardInteractivePrompt {
+                    prompt: "Verification code: ".to_string(),
+                    echo: true,
+                },
+                KeyboardInteractivePrompt {
+                    prompt: "Password: ".to_string(),
+                    echo: false,
+                },
+            ],
+        };
+
+        let wire = serde_json::to_string(&message).expect("serialize");
+        let decoded: IpcMessage = serde_json::from_str(&wire).expect("deserialize");
+
+        match decoded {
+            IpcMessage::KeyboardInteractivePrompts {
+                auth_id,
+                name,
+                instructions,
+                prompts,
+            } => {
+                assert_eq!(auth_id, "auth-1");
+                assert_eq!(name, "Two-factor");
+                assert_eq!(instructions, "Enter your code");
+                assert_eq!(prompts.len(), 2);
+                assert_eq!(prompts[0].prompt, "Verification code: ");
+                assert!(prompts[0].echo);
+                // The one that must never be shown on screen.
+                assert!(!prompts[1].echo);
+            }
+            other => panic!("wrong variant after round trip: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn keyboard_interactive_requests_survive_the_socket_round_trip() {
+        let start = IpcMessage::StartKeyboardInteractive {
+            server_name: "backup".to_string(),
+            cols: Some(120),
+            rows: Some(40),
+        };
+        let wire = serde_json::to_string(&start).expect("serialize");
+        match serde_json::from_str::<IpcMessage>(&wire).expect("deserialize") {
+            IpcMessage::StartKeyboardInteractive {
+                server_name,
+                cols,
+                rows,
+            } => {
+                assert_eq!(server_name, "backup");
+                assert_eq!(cols, Some(120));
+                assert_eq!(rows, Some(40));
+            }
+            other => panic!("wrong variant after round trip: {:?}", other),
+        }
+
+        let respond = IpcMessage::RespondKeyboardInteractive {
+            auth_id: "auth-1".to_string(),
+            responses: vec!["123456".to_string(), "secret".to_string()],
+        };
+        let wire = serde_json::to_string(&respond).expect("serialize");
+        match serde_json::from_str::<IpcMessage>(&wire).expect("deserialize") {
+            IpcMessage::RespondKeyboardInteractive { auth_id, responses } => {
+                assert_eq!(auth_id, "auth-1");
+                // Order matters: answers are matched to prompts by position.
+                assert_eq!(responses, vec!["123456".to_string(), "secret".to_string()]);
+            }
+            other => panic!("wrong variant after round trip: {:?}", other),
+        }
     }
 }
