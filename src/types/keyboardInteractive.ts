@@ -49,6 +49,12 @@ export interface KeyboardInteractivePrompts {
   /** Optional instructions supplied by the server (often empty). */
   instructions: string;
   prompts: KeyboardInteractivePrompt[];
+  /**
+   * Prompts already answered from the credential saved for this server, so the
+   * dialog can say so instead of leaving the user wondering what happened to
+   * the password step.
+   */
+  autoAnswered: string[];
 }
 
 /** One step of a keyboard-interactive conversation. */

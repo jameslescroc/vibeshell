@@ -24,9 +24,10 @@ const cancelKeyboardInteractive = vi.fn();
 function promptsStep(
   authId: string,
   prompts: { prompt: string; echo: boolean }[],
-  instructions = ''
+  instructions = '',
+  autoAnswered: string[] = []
 ): KeyboardInteractiveStep {
-  return { kind: 'prompts', authId, name: '', instructions, prompts };
+  return { kind: 'prompts', authId, name: '', instructions, prompts, autoAnswered };
 }
 
 describe('KeyboardInteractiveDialog', () => {
@@ -186,6 +187,25 @@ describe('KeyboardInteractiveDialog', () => {
 
     expect(await screen.findByText(/rejected the code or password/i)).toBeInTheDocument();
     expect(screen.queryByLabelText('Verification code:')).not.toBeInTheDocument();
+  });
+
+  it('says which prompts were answered from the saved credentials', async () => {
+    startKeyboardInteractive.mockResolvedValue(
+      promptsStep('auth-1', [{ prompt: 'Verification code: ', echo: true }], '', ['Password:'])
+    );
+
+    render(
+      <KeyboardInteractiveDialog
+        isOpen
+        server={twoFactorServer}
+        onClose={() => {}}
+        onConnected={() => {}}
+      />
+    );
+
+    // Otherwise the password step silently vanishing looks like a bug.
+    expect(await screen.findByText(/Password: answered from your saved credentials/i))
+      .toBeInTheDocument();
   });
 
   it('cancels the half-authenticated exchange when the user backs out', async () => {

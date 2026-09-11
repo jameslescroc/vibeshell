@@ -38,6 +38,7 @@ export function KeyboardInteractiveDialog({
   const [name, setName] = useState('');
   const [instructions, setInstructions] = useState('');
   const [prompts, setPrompts] = useState<KeyboardInteractivePrompt[]>([]);
+  const [autoAnswered, setAutoAnswered] = useState<string[]>([]);
   const [answers, setAnswers] = useState<string[]>([]);
   const [revealed, setRevealed] = useState<boolean[]>([]);
   const [isBusy, setIsBusy] = useState(false);
@@ -79,6 +80,7 @@ export function KeyboardInteractiveDialog({
 
       setName(step.name);
       setInstructions(step.instructions);
+      setAutoAnswered(step.autoAnswered ?? []);
 
       if (step.prompts.length === 0) {
         // The backend answers message-only rounds (RFC 4256 allows an info
@@ -231,6 +233,16 @@ export function KeyboardInteractiveDialog({
           {instructions.trim() !== '' && (
             <div className="p-3 rounded-md bg-tokyo-blue/10 border border-tokyo-blue/30 text-tokyo-blue text-sm whitespace-pre-wrap break-words">
               {instructions}
+            </div>
+          )}
+
+          {autoAnswered.length > 0 && (
+            <div className="p-3 rounded-md bg-tokyo-green/10 border border-tokyo-green/30 text-tokyo-green text-sm">
+              {autoAnswered.map((label) => (
+                <div key={label} className="break-words">
+                  {label} answered from your saved credentials.
+                </div>
+              ))}
             </div>
           )}
 

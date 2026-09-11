@@ -55,6 +55,9 @@ pub struct Session {
 
     // Last observed activity (attach/input/output/resize/exec).
     last_activity: Arc<RwLock<Instant>>,
+
+    // Whether reconnecting requires a human (two-factor authentication).
+    costly_to_reauthenticate: Arc<RwLock<bool>>,
 }
 
 impl Session {
@@ -77,7 +80,23 @@ impl Session {
             output_forwarder_started: Arc::new(Mutex::new(false)),
             client_count: Arc::new(RwLock::new(0)),
             last_activity: Arc::new(RwLock::new(Instant::now())),
+            costly_to_reauthenticate: Arc::new(RwLock::new(false)),
         }
+    }
+
+    /// Mark this session as one that a human had to authenticate by hand.
+    ///
+    /// Keyboard-interactive sessions are created by someone reading a code off
+    /// an authenticator. Reaping one because it sat idle would silently make
+    /// the next command fail and demand a fresh code, so they are kept until
+    /// they are closed or the service stops.
+    pub async fn mark_costly_to_reauthenticate(&self) {
+        let mut costly = self.costly_to_reauthenticate.write().await;
+        *costly = true;
+    }
+
+    pub async fn is_costly_to_reauthenticate(&self) -> bool {
+        *self.costly_to_reauthenticate.read().await
     }
 
     pub async fn mark_activity(&self) {
@@ -91,6 +110,9 @@ impl Session {
     }
 
     pub async fn should_reap(&self, max_idle: Duration) -> bool {
+        if self.is_costly_to_reauthenticate().await {
+            return false;
+        }
         self.client_count().await == 0 && self.idle_for().await >= max_idle
     }
 

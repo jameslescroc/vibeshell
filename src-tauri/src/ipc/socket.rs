@@ -279,6 +279,9 @@ pub enum IpcMessage {
         name: String,
         instructions: String,
         prompts: Vec<KeyboardInteractivePrompt>,
+        /// Prompts already answered from the saved credential.
+        #[serde(default)]
+        auto_answered: Vec<String>,
     },
     /// The server refused the keyboard-interactive answers. The connection has
     /// been discarded; retrying means starting a new exchange.
@@ -311,11 +314,13 @@ fn keyboard_interactive_step_to_ipc(auth_id: String, step: KeyboardInteractiveSt
             name,
             instructions,
             prompts,
+            auto_answered,
         } => IpcMessage::KeyboardInteractivePrompts {
             auth_id,
             name,
             instructions,
             prompts,
+            auto_answered,
         },
     }
 }
@@ -2221,6 +2226,7 @@ mod tests {
                     echo: false,
                 },
             ],
+            auto_answered: vec!["Old password:".to_string()],
         };
 
         let wire = serde_json::to_string(&message).expect("serialize");
@@ -2232,6 +2238,7 @@ mod tests {
                 name,
                 instructions,
                 prompts,
+                auto_answered,
             } => {
                 assert_eq!(auth_id, "auth-1");
                 assert_eq!(name, "Two-factor");
@@ -2241,6 +2248,7 @@ mod tests {
                 assert!(prompts[0].echo);
                 // The one that must never be shown on screen.
                 assert!(!prompts[1].echo);
+                assert_eq!(auto_answered, vec!["Old password:".to_string()]);
             }
             other => panic!("wrong variant after round trip: {:?}", other),
         }

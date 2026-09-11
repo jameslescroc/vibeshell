@@ -13,7 +13,7 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::{bail, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 use vibeshell_core::ipc::IpcMessage;
 use vibeshell_core::ssh::KeyboardInteractivePrompt;
@@ -54,6 +54,7 @@ pub fn authenticate(server_name: &str) -> Result<Option<String>> {
                 name,
                 instructions,
                 prompts,
+                auto_answered,
             } => {
                 if !announced {
                     eprintln!(
@@ -61,6 +62,10 @@ pub fn authenticate(server_name: &str) -> Result<Option<String>> {
                         server_name
                     );
                     announced = true;
+                }
+
+                for label in &auto_answered {
+                    eprintln!("  {} answered from your saved credentials.", label);
                 }
 
                 let answers = match collect_answers(&name, &instructions, &prompts) {
@@ -158,30 +163,140 @@ fn read_hidden(label: &str) -> Result<String> {
     result
 }
 
+/// What a key event means while an answer is being typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KeyAction {
+    /// The answer is complete.
+    Validate,
+    /// Add this character to the answer.
+    Append(char),
+    /// Remove the last character.
+    Erase,
+    /// Clear what has been typed so far.
+    Clear,
+    /// Abandon the prompt.
+    Cancel,
+    /// Nothing to do.
+    Ignore,
+}
+
+/// Decide what a key event means, with no terminal involved.
+///
+/// This is separate from the read loop so it can actually be tested. The
+/// distinction that matters is `KeyEventKind`: on Windows, crossterm reports
+/// key *releases* as well as presses. Ignoring that field made the release of
+/// the Enter that launched the command count as "answer submitted", so the
+/// prompt was answered with an empty string before the user could type
+/// anything. Only presses and auto-repeats may act.
+pub(crate) fn interpret_key(event: KeyEvent) -> KeyAction {
+    if !matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return KeyAction::Ignore;
+    }
+
+    match event.code {
+        KeyCode::Enter => KeyAction::Validate,
+        KeyCode::Backspace => KeyAction::Erase,
+        KeyCode::Esc => KeyAction::Cancel,
+        KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => KeyAction::Cancel,
+        KeyCode::Char('u') if event.modifiers.contains(KeyModifiers::CONTROL) => KeyAction::Clear,
+        // A bare Ctrl+<letter> is a control code, not text to type.
+        KeyCode::Char(_) if event.modifiers.contains(KeyModifiers::CONTROL) => KeyAction::Ignore,
+        KeyCode::Char(character) => KeyAction::Append(character),
+        _ => KeyAction::Ignore,
+    }
+}
+
 fn read_hidden_raw() -> Result<String> {
+    // Anything already queued belongs to whatever happened before this prompt,
+    // typically the Enter that launched the command. Discard it so it cannot
+    // be mistaken for an answer.
+    while event::poll(std::time::Duration::from_millis(0))? {
+        let _ = event::read()?;
+    }
+
     let mut answer = String::new();
 
     loop {
-        match event::read()? {
-            Event::Key(KeyEvent {
-                code, modifiers, ..
-            }) => match code {
-                KeyCode::Enter => return Ok(answer),
-                KeyCode::Backspace => {
-                    answer.pop();
-                }
-                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    bail!("Cancelled")
-                }
-                KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    answer.clear();
-                }
-                KeyCode::Char(character) => answer.push(character),
-                KeyCode::Esc => bail!("Cancelled"),
-                _ => {}
-            },
-            Event::Resize(_, _) => {}
-            _ => {}
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+
+        match interpret_key(key) {
+            KeyAction::Validate => return Ok(answer),
+            KeyAction::Append(character) => answer.push(character),
+            KeyAction::Erase => {
+                answer.pop();
+            }
+            KeyAction::Clear => answer.clear(),
+            KeyAction::Cancel => bail!("Cancelled"),
+            KeyAction::Ignore => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind)
+    }
+
+    /// The bug this whole function exists to prevent: on Windows the release of
+    /// the Enter that launched the command arrives as soon as raw mode starts,
+    /// and used to submit an empty answer before anything could be typed.
+    #[test]
+    fn releasing_enter_does_not_submit_the_answer() {
+        assert_eq!(
+            interpret_key(key(KeyCode::Enter, KeyEventKind::Release)),
+            KeyAction::Ignore
+        );
+        assert_eq!(
+            interpret_key(key(KeyCode::Enter, KeyEventKind::Press)),
+            KeyAction::Validate
+        );
+    }
+
+    #[test]
+    fn releasing_a_character_does_not_type_it_twice() {
+        assert_eq!(
+            interpret_key(key(KeyCode::Char('7'), KeyEventKind::Press)),
+            KeyAction::Append('7')
+        );
+        assert_eq!(
+            interpret_key(key(KeyCode::Char('7'), KeyEventKind::Release)),
+            KeyAction::Ignore
+        );
+    }
+
+    #[test]
+    fn auto_repeat_still_types() {
+        assert_eq!(
+            interpret_key(key(KeyCode::Char('x'), KeyEventKind::Repeat)),
+            KeyAction::Append('x')
+        );
+    }
+
+    #[test]
+    fn editing_keys_behave() {
+        assert_eq!(
+            interpret_key(key(KeyCode::Backspace, KeyEventKind::Press)),
+            KeyAction::Erase
+        );
+        assert_eq!(
+            interpret_key(key(KeyCode::Esc, KeyEventKind::Press)),
+            KeyAction::Cancel
+        );
+    }
+
+    #[test]
+    fn control_combinations_are_not_typed_into_the_answer() {
+        let ctrl = |c| {
+            KeyEvent::new_with_kind(KeyCode::Char(c), KeyModifiers::CONTROL, KeyEventKind::Press)
+        };
+        assert_eq!(interpret_key(ctrl('c')), KeyAction::Cancel);
+        assert_eq!(interpret_key(ctrl('u')), KeyAction::Clear);
+        // Ctrl+A must not append a literal 'a' to a password.
+        assert_eq!(interpret_key(ctrl('a')), KeyAction::Ignore);
     }
 }

@@ -558,6 +558,8 @@ async fn execute_tool(state: &McpState, name: &str, args: &Value) -> Result<Stri
         // Session Management
         "session_list" => tool_session_list(state).await,
         "session_create" => tool_session_create(state, args).await,
+        "session_auth_start" => tool_session_auth_start(state, args).await,
+        "session_auth_respond" => tool_session_auth_respond(state, args).await,
         "session_attach" => tool_session_attach(state, args).await,
         "session_detach" => tool_session_detach(state, args).await,
         "session_kill" => tool_session_kill(state, args).await,
@@ -916,6 +918,130 @@ async fn tool_session_create(state: &McpState, args: &Value) -> Result<String, S
 
     let info = session.get_info().await;
     serde_json::to_string(&json!({"id": short_id(&info.id), "server": info.server_name, "state": info.state, "clients": info.clients})).map_err(|e| e.to_string())
+}
+
+/// Resolve `server_name` or `server_id` the way `session_create` does.
+fn resolve_server_name(state: &McpState, args: &Value) -> Result<String, String> {
+    if let Some(name) = args.get("server_name").and_then(|v| v.as_str()) {
+        return Ok(name.to_string());
+    }
+    let server_id = args
+        .get("server_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Either 'server_id' or 'server_name' must be provided".to_string())?;
+    let server = state
+        .database
+        .server_get(&resolve_server_id(state, server_id)?)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Server not found: {}", server_id))?;
+    Ok(server.name)
+}
+
+/// Render one step of a keyboard-interactive exchange for an agent to act on.
+///
+/// `echo` is passed through as `secret` so a caller knows which answers must
+/// not be displayed or logged. A long-lived password should never be requested
+/// in a chat transcript; that is what `save_in_app` flags.
+async fn keyboard_interactive_step_to_json(
+    auth_id: String,
+    step: crate::session::KeyboardInteractiveStep,
+) -> Result<String, String> {
+    use crate::session::KeyboardInteractiveStep;
+
+    let payload = match step {
+        KeyboardInteractiveStep::Authenticated(session) => {
+            let info = session.get_info().await;
+            json!({
+                "status": "authenticated",
+                "id": short_id(&info.id),
+                "server": info.server_name,
+                "state": info.state,
+            })
+        }
+        KeyboardInteractiveStep::Rejected => json!({
+            "status": "rejected",
+            "message": "The server refused the answers. The connection was discarded; \
+                        start a new exchange to retry.",
+        }),
+        KeyboardInteractiveStep::Prompts {
+            name,
+            instructions,
+            prompts,
+            auto_answered,
+        } => {
+            let prompts: Vec<Value> = prompts
+                .into_iter()
+                .map(|prompt| {
+                    let label = prompt.prompt.trim().to_string();
+                    let looks_like_password = !prompt.echo
+                        && (label.to_lowercase().contains("password")
+                            || label.to_lowercase().contains("mot de passe"));
+                    json!({
+                        "prompt": label,
+                        "secret": !prompt.echo,
+                        "save_in_app": looks_like_password,
+                    })
+                })
+                .collect();
+
+            json!({
+                "status": "prompts",
+                "auth_id": auth_id,
+                "name": name,
+                "instructions": instructions,
+                "prompts": prompts,
+                "auto_answered": auto_answered,
+            })
+        }
+    };
+
+    serde_json::to_string(&payload).map_err(|e| e.to_string())
+}
+
+async fn tool_session_auth_start(state: &McpState, args: &Value) -> Result<String, String> {
+    let server_name = resolve_server_name(state, args)?;
+
+    let (auth_id, step) = state
+        .session_manager
+        .start_keyboard_interactive(&server_name, Some(crate::ssh::PtyConfig::default()))
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to start authentication for '{}': {}",
+                server_name, e
+            )
+        })?;
+
+    keyboard_interactive_step_to_json(auth_id, step).await
+}
+
+async fn tool_session_auth_respond(state: &McpState, args: &Value) -> Result<String, String> {
+    let auth_id = args
+        .get("auth_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "'auth_id' is required".to_string())?
+        .to_string();
+
+    let responses = args
+        .get("responses")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "'responses' must be an array of strings".to_string())?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| "'responses' must contain only strings".to_string())
+        })
+        .collect::<Result<Vec<String>, String>>()?;
+
+    let step = state
+        .session_manager
+        .respond_keyboard_interactive(&auth_id, responses)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    keyboard_interactive_step_to_json(auth_id, step).await
 }
 
 async fn tool_session_attach(state: &McpState, args: &Value) -> Result<String, String> {

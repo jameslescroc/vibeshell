@@ -83,6 +83,10 @@ pub enum KeyboardInteractiveStepDto {
         name: String,
         instructions: String,
         prompts: Vec<KeyboardInteractivePrompt>,
+        /// Prompts already answered from the saved credential, so the dialog
+        /// can say so rather than leave the user wondering where the password
+        /// step went.
+        auto_answered: Vec<String>,
     },
 }
 
@@ -589,11 +593,13 @@ async fn keyboard_interactive_step_to_dto(
             name,
             instructions,
             prompts,
+            auto_answered,
         } => Ok(KeyboardInteractiveStepDto::Prompts {
             auth_id,
             name,
             instructions,
             prompts,
+            auto_answered,
         }),
     }
 }
@@ -1597,6 +1603,7 @@ mod keyboard_interactive_tests {
                     echo: false,
                 },
             ],
+            auto_answered: Vec::new(),
         };
 
         let json = serde_json::to_value(&dto).unwrap();

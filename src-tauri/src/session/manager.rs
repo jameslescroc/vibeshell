@@ -79,6 +79,25 @@ struct PendingKeyboardInteractive {
     output_rx: mpsc::Receiver<Vec<u8>>,
     pty_config: Option<PtyConfig>,
     started_at: Instant,
+    /// The stored password is offered at most once per exchange. A server that
+    /// asks again is rejecting it, and replaying it would burn login attempts
+    /// in a loop.
+    stored_password_used: bool,
+}
+
+/// Can this prompt be answered from the credential saved for the server?
+///
+/// Only a prompt the server marks as hidden and labels as a password
+/// qualifies. This is a heuristic on server-supplied text, and it is meant to
+/// fail closed: when it does not match, the human is asked, which is the
+/// behaviour we had before. It must never be widened to echoing prompts, or a
+/// stored password could be sent in answer to "Verification code:".
+fn prompt_wants_stored_password(prompt: &KeyboardInteractivePrompt) -> bool {
+    if prompt.echo {
+        return false;
+    }
+    let label = prompt.prompt.to_lowercase();
+    label.contains("password") || label.contains("mot de passe")
 }
 
 impl PendingKeyboardInteractive {
@@ -104,6 +123,10 @@ pub enum KeyboardInteractiveStep {
         name: String,
         instructions: String,
         prompts: Vec<KeyboardInteractivePrompt>,
+        /// Labels of prompts that were answered from the saved credential
+        /// without asking anyone. Reported so a caller can say so instead of
+        /// leaving the user wondering what happened to the password step.
+        auto_answered: Vec<String>,
     },
 }
 
@@ -805,6 +828,17 @@ impl SessionManager {
             .connect_keyboard_interactive(&server.host, server.port, &server.username, None)
             .await?;
 
+        let mut stored_password_used = false;
+        let (outcome, auto_answered) = self
+            .autofill_keyboard_interactive(
+                &server.name,
+                &server.username,
+                &mut client,
+                &mut stored_password_used,
+                outcome,
+            )
+            .await?;
+
         let auth_id = Uuid::new_v4().to_string();
 
         match outcome {
@@ -836,6 +870,7 @@ impl SessionManager {
                     output_rx: ssh_output_rx,
                     pty_config,
                     started_at: Instant::now(),
+                    stored_password_used,
                 };
                 self.pending_keyboard_interactive
                     .write()
@@ -854,6 +889,7 @@ impl SessionManager {
                         name,
                         instructions,
                         prompts,
+                        auto_answered,
                     },
                 ))
             }
@@ -887,10 +923,23 @@ impl SessionManager {
             })?;
 
         let username = pending.username.clone();
+        let server_name = pending.server_name.clone();
         let outcome = pending
             .client
             .keyboard_interactive_respond(&username, responses)
             .await?;
+
+        let mut stored_password_used = pending.stored_password_used;
+        let (outcome, auto_answered) = self
+            .autofill_keyboard_interactive(
+                &server_name,
+                &username,
+                &mut pending.client,
+                &mut stored_password_used,
+                outcome,
+            )
+            .await?;
+        pending.stored_password_used = stored_password_used;
 
         match outcome {
             KeyboardInteractiveOutcome::Authenticated => {
@@ -941,6 +990,7 @@ impl SessionManager {
                     name,
                     instructions,
                     prompts,
+                    auto_answered,
                 })
             }
         }
@@ -969,6 +1019,79 @@ impl SessionManager {
         }
 
         Ok(())
+    }
+
+    /// Password saved for this server, if there is one to offer.
+    fn stored_password(&self, server_name: &str) -> Result<Option<String>> {
+        let Some(credential) = self.database.credential_get(server_name)? else {
+            return Ok(None);
+        };
+        if credential.auth_type != "password" || credential.credential.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(credential.credential))
+    }
+
+    /// Answer rounds that only ask for the saved password, so the user is asked
+    /// for the one thing they alone can supply: the code.
+    ///
+    /// A round is only answered when **every** prompt in it wants the stored
+    /// password. Rounds are all-or-nothing in RFC 4256 — one answer per prompt,
+    /// in order — so a round mixing a code and a password is handed to the
+    /// caller untouched rather than half-guessed.
+    async fn autofill_keyboard_interactive(
+        &self,
+        server_name: &str,
+        username: &str,
+        client: &mut SshClient,
+        stored_password_used: &mut bool,
+        mut outcome: KeyboardInteractiveOutcome,
+    ) -> Result<(KeyboardInteractiveOutcome, Vec<String>)> {
+        let mut auto_answered: Vec<String> = Vec::new();
+
+        loop {
+            let fillable = match &outcome {
+                KeyboardInteractiveOutcome::Prompts { prompts, .. } => {
+                    !*stored_password_used
+                        && !prompts.is_empty()
+                        && prompts.iter().all(prompt_wants_stored_password)
+                }
+                _ => false,
+            };
+
+            if !fillable {
+                return Ok((outcome, auto_answered));
+            }
+
+            let Some(password) = self.stored_password(server_name)? else {
+                debug!(
+                    "[SessionManager] '{}' asks for a password but none is saved; asking the user",
+                    server_name
+                );
+                return Ok((outcome, auto_answered));
+            };
+
+            let count = match &outcome {
+                KeyboardInteractiveOutcome::Prompts { prompts, .. } => {
+                    for prompt in prompts {
+                        auto_answered.push(prompt.prompt.trim().to_string());
+                    }
+                    prompts.len()
+                }
+                _ => unreachable!("checked by `fillable` above"),
+            };
+
+            info!(
+                "[SessionManager] Answering {} keyboard-interactive password prompt(s) for '{}' \
+                 from the saved credential",
+                count, server_name
+            );
+            *stored_password_used = true;
+
+            outcome = client
+                .keyboard_interactive_respond(username, vec![password; count])
+                .await?;
+        }
     }
 
     /// Number of exchanges currently waiting for user input.
@@ -1027,6 +1150,9 @@ impl SessionManager {
 
         session.set_ssh_client(ssh_client).await;
         session.set_state(SessionState::Connected).await;
+        // Reconnecting would mean asking a human for a fresh code, so this
+        // session must outlive the idle reaper.
+        session.mark_costly_to_reauthenticate().await;
 
         // Bridge SSH output to the session broadcast channel.
         let session_for_output = session.clone();
@@ -1217,6 +1343,52 @@ mod tests {
         // The message has to mention the expiry, because that is the most
         // likely reason an id stops being known.
         assert!(error.contains("expired"), "unexpected error: {error}");
+    }
+
+    fn prompt(label: &str, echo: bool) -> KeyboardInteractivePrompt {
+        KeyboardInteractivePrompt {
+            prompt: label.to_string(),
+            echo,
+        }
+    }
+
+    #[test]
+    fn a_hidden_password_prompt_can_be_answered_from_the_saved_credential() {
+        assert!(prompt_wants_stored_password(&prompt("Password: ", false)));
+        assert!(prompt_wants_stored_password(&prompt(
+            "root@host's Password:",
+            false
+        )));
+        assert!(prompt_wants_stored_password(&prompt(
+            "Mot de passe : ",
+            false
+        )));
+    }
+
+    #[test]
+    fn a_one_time_code_is_never_answered_from_the_saved_credential() {
+        // The failure this guards against is sending the account password in
+        // answer to a code prompt, which would hand it to anything listening
+        // and burn a login attempt.
+        assert!(!prompt_wants_stored_password(&prompt(
+            "Verification code: ",
+            false
+        )));
+        assert!(!prompt_wants_stored_password(&prompt("OTP: ", false)));
+        assert!(!prompt_wants_stored_password(&prompt(
+            "Two-factor token:",
+            false
+        )));
+    }
+
+    #[test]
+    fn an_echoing_prompt_is_never_answered_from_the_saved_credential() {
+        // A server that echoes what is typed is not asking for a secret, even
+        // if the word "password" appears in the label.
+        assert!(!prompt_wants_stored_password(&prompt(
+            "Enter your password hint: ",
+            true
+        )));
     }
 
     #[test]

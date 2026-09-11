@@ -44,6 +44,8 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         // === Session Management Tools ===
         session_list_tool(),
         session_create_tool(),
+        session_auth_start_tool(),
+        session_auth_respond_tool(),
         session_attach_tool(),
         session_detach_tool(),
         session_kill_tool(),
@@ -301,6 +303,58 @@ fn session_create_tool() -> ToolDefinition {
                     "default": false
                 }
             },
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn session_auth_start_tool() -> ToolDefinition {
+    ToolDefinition::new(
+        "session_auth_start",
+        "Begin two-factor (keyboard-interactive) authentication for a server that \
+         session_create cannot reach, and return the questions the server asks. Prompts \
+         that match a saved password are answered automatically, so usually only a \
+         one-time code is left. Ask the user for that code and pass it to \
+         session_auth_respond. Never ask the user for a long-lived password here: tell \
+         them to save it in VibeShell instead.",
+        json!({
+            "type": "object",
+            "properties": {
+                "server_id": {
+                    "type": "string",
+                    "description": "Server ID to connect to"
+                },
+                "server_name": {
+                    "type": "string",
+                    "description": "Server name to connect to (used if server_id not provided)"
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn session_auth_respond_tool() -> ToolDefinition {
+    ToolDefinition::new(
+        "session_auth_respond",
+        "Answer the questions returned by session_auth_start. Supply exactly one answer \
+         per prompt, in the order the prompts were given. The server may reply with more \
+         questions, in which case call this again with the same auth_id. On success a \
+         connected session is returned and can be used like any other.",
+        json!({
+            "type": "object",
+            "properties": {
+                "auth_id": {
+                    "type": "string",
+                    "description": "Exchange ID returned by session_auth_start"
+                },
+                "responses": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "One answer per prompt, in the order received"
+                }
+            },
+            "required": ["auth_id", "responses"],
             "additionalProperties": false
         }),
     )
@@ -935,7 +989,7 @@ mod tests {
         let tools = get_tool_definitions();
 
         // Verify we have all expected tools
-        assert_eq!(tools.len(), 28);
+        assert_eq!(tools.len(), 30);
 
         // Check that all tools have non-empty names and descriptions
         for tool in &tools {
@@ -950,6 +1004,10 @@ mod tests {
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(tool_names.contains(&"server_list"));
         assert!(tool_names.contains(&"session_create"));
+        // Without these an agent has no way to reach a two-factor server and
+        // can only report that it cannot connect.
+        assert!(tool_names.contains(&"session_auth_start"));
+        assert!(tool_names.contains(&"session_auth_respond"));
         assert!(tool_names.contains(&"session_send_input"));
         assert!(tool_names.contains(&"session_read"));
         assert!(tool_names.contains(&"session_resize"));
@@ -988,7 +1046,7 @@ mod tests {
     #[test]
     fn compact_definitions_drop_repeated_schema_prose() {
         let tools = get_compact_tool_definitions();
-        assert_eq!(tools.len(), 28);
+        assert_eq!(tools.len(), 30);
         let encoded = serde_json::to_string(&tools).unwrap();
         assert!(!encoded.contains("Filter servers by group ID"));
         assert!(!encoded.contains("\"default\""));
