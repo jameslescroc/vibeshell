@@ -196,6 +196,10 @@ export function ConnectDialog({ isOpen, server, forceNew = false, onClose, onCon
       if (session) {
         onConnected(session.id);
         onClose();
+      } else if (needsKeyboardInteractive(useSessionStore.getState().error)) {
+        // The server wants a 2FA code after (or instead of) the password:
+        // continue in the keyboard-interactive dialog rather than failing.
+        setUseKeyboardInteractive(true);
       } else {
         console.error('[ConnectDialog] Connection failed: session is null');
         setError('Failed to connect. Check your credentials and try again.');
