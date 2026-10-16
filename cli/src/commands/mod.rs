@@ -7,6 +7,7 @@ pub mod file_tools;
 pub mod import;
 pub mod install;
 pub mod mcp;
+pub mod plugins;
 pub mod server;
 pub mod session;
 pub mod sftp;
