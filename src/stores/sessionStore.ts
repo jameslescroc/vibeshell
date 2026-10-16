@@ -494,16 +494,40 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   startKeyboardInteractive: async (serverName: string, cols?: number, rows?: number) => {
     set({ loading: true, error: null });
 
-    const result = await safeInvoke<KeyboardInteractiveStep>(
-      'session_keyboard_interactive_start',
-      {
+    const start = () =>
+      safeInvoke<KeyboardInteractiveStep>('session_keyboard_interactive_start', {
         request: {
           serverName,
           cols: cols ?? 80,
           rows: rows ?? 24,
         },
+      });
+
+    let result = await start();
+
+    // The backend refuses an untrusted host key during the handshake, before
+    // any answer is sent. Offer the same approval as the password/key path,
+    // then retry once.
+    if (!result.success) {
+      const hostKeyError = parseHostKeyError(result.error.message);
+      if (hostKeyError && hostKeyError.host && hostKeyError.port && hostKeyError.fingerprint) {
+        const approved = await useFingerprintStore.getState().requestHostKeyApproval({
+          host: hostKeyError.host,
+          port: hostKeyError.port,
+          fingerprint: hostKeyError.fingerprint,
+          algorithm: hostKeyError.keyType ?? 'unknown',
+          serverName,
+          status: hostKeyError.kind,
+          storedFingerprint: hostKeyError.storedFingerprint,
+          storedAlgorithm: hostKeyError.storedKeyType,
+        });
+        if (!approved) {
+          set({ loading: false, error: 'Connection cancelled: host key not trusted' });
+          return null;
+        }
+        result = await start();
       }
-    );
+    }
 
     if (!result.success) {
       set({ error: result.error.message, loading: false });

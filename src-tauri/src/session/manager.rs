@@ -916,6 +916,7 @@ impl SessionManager {
 
         let (ssh_output_tx, ssh_output_rx) = mpsc::channel::<Vec<u8>>(256);
         let mut client = SshClient::new(ssh_output_tx);
+        client.set_host_key_check(self.host_key_check(&server.host, server.port)?);
 
         let outcome = client
             .connect_keyboard_interactive(&server.host, server.port, &server.username, None)
