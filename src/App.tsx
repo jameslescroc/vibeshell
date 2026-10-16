@@ -44,7 +44,11 @@ import { TitleBar } from './components/TitleBar';
 import { SftpPanel, SftpPanelHandle } from './components/SftpPanel';
 import { AddServerDialog } from './components/AddServerDialog';
 import { EditServerDialog } from './components/EditServerDialog';
-import { ConnectDialog } from './components/ConnectDialog';
+import {
+  ConnectDialog,
+  needsKeyboardInteractive,
+  preferKeyboardInteractive,
+} from './components/ConnectDialog';
 import { SelectServerDialog } from './components/SelectServerDialog';
 import { QuickCommandDialog } from './components/QuickCommandDialog';
 import { CommandHistoryDialog } from './components/CommandHistoryDialog';
@@ -571,6 +575,11 @@ function App() {
       if (session) {
         handleConnected(session.id);
       } else {
+        // A 2FA server asked for a code the saved password cannot answer:
+        // open the dialog straight into the keyboard-interactive flow.
+        if (needsKeyboardInteractive(useSessionStore.getState().error)) {
+          preferKeyboardInteractive(server.name);
+        }
         setServerToConnect(server);
         setConnectForceNew(forceNew);
         setIsConnectOpen(true);

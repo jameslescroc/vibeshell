@@ -1,1 +1,1 @@
-export { ConnectDialog } from './ConnectDialog';
+export { ConnectDialog, needsKeyboardInteractive, preferKeyboardInteractive } from './ConnectDialog';

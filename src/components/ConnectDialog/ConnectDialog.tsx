@@ -48,6 +48,20 @@ function writePreferredAuthMethod(serverName: string, method: 'keyboard-interact
   }
 }
 
+/**
+ * True when a saved-credential connect failed because the server wants a
+ * keyboard-interactive answer (typically a 2FA code) the saved password
+ * cannot provide. Matches the backend error from `SshClient::connect_password`.
+ */
+export function needsKeyboardInteractive(message: string | null | undefined): boolean {
+  return !!message && /requires interactive authentication/i.test(message);
+}
+
+/** Make the next ConnectDialog for this server open straight into the 2FA flow. */
+export function preferKeyboardInteractive(serverName: string): void {
+  writePreferredAuthMethod(serverName, 'keyboard-interactive');
+}
+
 function JumpHostBadge({ jumpHostId }: { jumpHostId: string }) {
   const { servers } = useServerStore();
   const jumpHost = servers.find((s) => s.id === jumpHostId);
