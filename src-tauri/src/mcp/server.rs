@@ -972,6 +972,22 @@ async fn tool_session_list(state: &McpState) -> Result<String, String> {
     serde_json::to_string(&compact).map_err(|e| e.to_string())
 }
 
+/// Explain a failed `session_create`. A two-factor server cannot be opened with
+/// the saved password alone, so point the agent at the 2FA tools instead of
+/// leaving it with a dead end.
+fn session_create_error(server_name: &str, error: &str) -> String {
+    let mut message = format!("Failed to connect to '{}': {}", server_name, error);
+    if error.contains("requires interactive authentication") {
+        message.push_str(&format!(
+            "\nThis server uses two-factor (keyboard-interactive) authentication. Call \
+             session_auth_start with server_name '{}', ask the user for the code it requests, \
+             then send it with session_auth_respond.",
+            server_name
+        ));
+    }
+    message
+}
+
 async fn tool_session_create(state: &McpState, args: &Value) -> Result<String, String> {
     // Resolve the server name: either from server_name directly or by looking up server_id
     let server_name = if let Some(name) = args.get("server_name").and_then(|v| v.as_str()) {
@@ -1033,7 +1049,7 @@ async fn tool_session_create(state: &McpState, args: &Value) -> Result<String, S
             Some(crate::ssh::PtyConfig::default()),
         )
         .await
-        .map_err(|e| format!("Failed to connect to '{}': {}", server_name, e))?;
+        .map_err(|e| session_create_error(&server_name, &e.to_string()))?;
 
     let info = session.get_info().await;
     serde_json::to_string(&json!({"id": short_id(&info.id), "server": info.server_name, "state": info.state, "clients": info.clients})).map_err(|e| e.to_string())
@@ -2247,6 +2263,27 @@ fn replace_text(
     updated.push_str(new_text);
     updated.push_str(&content[index + old_text.len()..]);
     Ok((updated, 1))
+}
+
+#[cfg(test)]
+mod session_create_error_tests {
+    use super::session_create_error;
+
+    #[test]
+    fn a_two_factor_server_points_the_agent_at_session_auth_start() {
+        let message = session_create_error(
+            "backup",
+            "Server requires interactive authentication not supported by saved-password login",
+        );
+        assert!(message.contains("session_auth_start"));
+        assert!(message.contains("'backup'"));
+    }
+
+    #[test]
+    fn other_failures_are_reported_unchanged() {
+        let message = session_create_error("backup", "Connection refused");
+        assert_eq!(message, "Failed to connect to 'backup': Connection refused");
+    }
 }
 
 #[cfg(test)]
